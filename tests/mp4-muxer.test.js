@@ -1,0 +1,182 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { buildMp4 } from '../muxers/mp4-muxer.js';
+import { concatBytes } from '../muxers/byte-writer.js';
+import {
+  loadFixtureVideo, makeMp3Audio, writeOutput, ffprobe, ffmpegDecodeErrors, FFPROBE, FFMPEG,
+  parseBoxes, findBox, findAllBoxes, readChunkOffsets, readStsz, readStts
+} from './helpers/media.js';
+
+const video = loadFixtureVideo();
+const audio = makeMp3Audio(2);
+
+function ascii(bytes) {
+  return String.fromCharCode(...bytes);
+}
+
+test('MP4: 최상위 박스는 ftyp, mdat, moov 순서이며 ftyp 브랜드는 isom이다', () => {
+  const file = concatBytes(buildMp4({ container: 'mp4', video, audio }));
+  const boxes = parseBoxes(file);
+  assert.deepEqual(boxes.map(b => b.type), ['ftyp', 'mdat', 'moov']);
+  assert.equal(ascii(boxes[0].payload.subarray(0, 4)), 'isom');
+  assert.equal(file.length, boxes.reduce((s, b) => s + b.size, 0), '박스 크기 합이 파일 크기와 같아야 함');
+});
+
+test('MOV: ftyp 브랜드는 "qt  "이고 오디오 샘플 엔트리는 ".mp3"이다', () => {
+  const file = concatBytes(buildMp4({ container: 'mov', video, audio }));
+  const boxes = parseBoxes(file);
+  assert.equal(ascii(boxes[0].payload.subarray(0, 4)), 'qt  ');
+  const traks = findAllBoxes(findBox(boxes, 'moov').children, 'trak');
+  const audioStsd = findBox(traks[1].children, 'mdia/minf/stbl/stsd');
+  assert.equal(audioStsd.children[0].type, '.mp3');
+  // MOV는 mdia/hdlr에 'mhlr' 컴포넌트 타입을 쓴다
+  const hdlr = findBox(traks[0].children, 'mdia/hdlr');
+  assert.equal(ascii(hdlr.payload.subarray(4, 8)), 'mhlr');
+  assert.equal(ascii(hdlr.payload.subarray(8, 12)), 'vide');
+});
+
+test('MP4: 비디오 트랙은 avc1+avcC, 오디오 트랙은 mp4a+esds(OTI 0x6B MP3)를 가진다', () => {
+  const file = concatBytes(buildMp4({ container: 'mp4', video, audio }));
+  const boxes = parseBoxes(file);
+  const traks = findAllBoxes(findBox(boxes, 'moov').children, 'trak');
+  assert.equal(traks.length, 2);
+
+  const vStsd = findBox(traks[0].children, 'mdia/minf/stbl/stsd');
+  assert.equal(vStsd.children[0].type, 'avc1');
+  const avc1 = vStsd.children[0].payload;
+  const view = new DataView(avc1.buffer, avc1.byteOffset, avc1.byteLength);
+  assert.equal(view.getUint16(24), 160, 'width');
+  assert.equal(view.getUint16(26), 120, 'height');
+  const avcCBoxes = parseBoxes(avc1, 78, avc1.length);
+  assert.equal(avcCBoxes[0].type, 'avcC');
+  assert.deepEqual(Array.from(avcCBoxes[0].payload), Array.from(video.avcC));
+
+  const aStsd = findBox(traks[1].children, 'mdia/minf/stbl/stsd');
+  assert.equal(aStsd.children[0].type, 'mp4a');
+  const mp4a = aStsd.children[0].payload;
+  const esds = parseBoxes(mp4a, 28, mp4a.length)[0];
+  assert.equal(esds.type, 'esds');
+  const idx6b = Array.from(esds.payload).indexOf(0x6B);
+  assert.ok(idx6b > 0, 'objectTypeIndication 0x6B(MP3) 포함');
+  assert.equal(esds.payload[idx6b + 1], 0x15, 'streamType=5(audio), reserved=1');
+});
+
+test('MP4: stco 오프셋은 mdat 안의 각 샘플 데이터를 정확히 가리킨다', () => {
+  const file = concatBytes(buildMp4({ container: 'mp4', video, audio }));
+  const boxes = parseBoxes(file);
+  const traks = findAllBoxes(findBox(boxes, 'moov').children, 'trak');
+
+  const vStbl = findBox(traks[0].children, 'mdia/minf/stbl').children;
+  const vOffsets = readChunkOffsets(vStbl);
+  const vSizes = readStsz(vStbl);
+  assert.equal(vOffsets.length, video.samples.length);
+  video.samples.forEach((s, i) => {
+    assert.equal(vSizes[i], s.data.length);
+    assert.deepEqual(Array.from(file.subarray(vOffsets[i], vOffsets[i] + 8)), Array.from(s.data.subarray(0, 8)), `video sample ${i}`);
+  });
+
+  const aStbl = findBox(traks[1].children, 'mdia/minf/stbl').children;
+  const aOffsets = readChunkOffsets(aStbl);
+  const aSizes = readStsz(aStbl);
+  assert.equal(aOffsets.length, audio.frames.length);
+  audio.frames.forEach((f, i) => {
+    assert.equal(aSizes[i], f.data.length);
+    assert.deepEqual(Array.from(file.subarray(aOffsets[i], aOffsets[i] + 4)), Array.from(f.data.subarray(0, 4)), `audio frame ${i}`);
+  });
+
+  // 비디오 샘플이 mdat 안에서 시간순으로 오디오와 교차 배치되어야 함(단조 증가)
+  const all = [...vOffsets, ...aOffsets].sort((a, b) => a - b);
+  assert.equal(new Set(all).size, all.length, '오프셋 중복 없음');
+});
+
+test('MP4: 비디오 stts는 30fps(90000/30=3000) 지속시간을 가지며 stss는 키프레임 1,31을 가리킨다', () => {
+  const file = concatBytes(buildMp4({ container: 'mp4', video, audio }));
+  const boxes = parseBoxes(file);
+  const traks = findAllBoxes(findBox(boxes, 'moov').children, 'trak');
+  const vStbl = findBox(traks[0].children, 'mdia/minf/stbl').children;
+  const stts = readStts(vStbl);
+  const totalCount = stts.reduce((s, e) => s + e.count, 0);
+  assert.equal(totalCount, 60);
+  // 마지막 샘플은 오디오 끝(2.0125s)까지 늘어나므로 그 앞 59개만 30fps 간격
+  const body = stts.slice(0, -1);
+  assert.equal(body.reduce((s, e) => s + e.count, 0), 59);
+  assert.ok(body.every(e => e.delta === 3000 || e.delta === 2999 || e.delta === 3001), JSON.stringify(stts));
+  const audioEnd = Math.round((audio.frames.reduce((s, f) => s + f.samples, 0) - 1105) * 90000 / 44100);
+  assert.ok(Math.abs(stts.reduce((s, e) => s + e.count * e.delta, 0) - audioEnd) <= 2);
+
+  const stss = vStbl.find(b => b.type === 'stss');
+  const view = new DataView(stss.payload.buffer, stss.payload.byteOffset, stss.payload.byteLength);
+  const count = view.getUint32(4);
+  const keys = [];
+  for (let i = 0; i < count; i++) keys.push(view.getUint32(8 + i * 4));
+  assert.deepEqual(keys, [1, 31]);
+});
+
+test('MP4: 비디오 타임스탬프의 원점은 첫 샘플이며, 불규칙한 간격도 stts에 반영된다', () => {
+  const irregular = {
+    ...video,
+    samples: video.samples.slice(0, 4).map((s, i) => ({ ...s, timestamp: 5_000_000 + [0, 40_000, 60_000, 100_000][i] }))
+  };
+  const file = concatBytes(buildMp4({ container: 'mp4', video: irregular, audio: null }));
+  const boxes = parseBoxes(file);
+  const trak = findBox(boxes, 'moov/trak');
+  const stts = readStts(findBox(trak.children, 'mdia/minf/stbl').children);
+  // 간격: 40ms=3600, 20ms=1800, 40ms=3600, 마지막은 직전 간격 반복(3600)
+  assert.deepEqual(stts, [{ count: 1, delta: 3600 }, { count: 1, delta: 1800 }, { count: 2, delta: 3600 }]);
+});
+
+test('MP4: 오디오 트랙은 MP3 인코더 지연(1105 샘플)을 elst로 보정한다', () => {
+  const file = concatBytes(buildMp4({ container: 'mp4', video, audio }));
+  const boxes = parseBoxes(file);
+  const traks = findAllBoxes(findBox(boxes, 'moov').children, 'trak');
+  const elst = findBox(traks[1].children, 'edts/elst');
+  assert.ok(elst, '오디오 트랙에 elst 존재');
+  const view = new DataView(elst.payload.buffer, elst.payload.byteOffset, elst.payload.byteLength);
+  assert.equal(view.getUint32(4), 1, 'entry_count');
+  assert.equal(view.getUint32(12), 1105, 'media_time = 인코더 지연');
+});
+
+test('MP4: 오디오 없이 비디오만으로도 생성된다', () => {
+  const file = concatBytes(buildMp4({ container: 'mp4', video, audio: null }));
+  const boxes = parseBoxes(file);
+  assert.equal(findAllBoxes(findBox(boxes, 'moov').children, 'trak').length, 1);
+});
+
+test('MP4: 샘플이 하나도 없으면 에러를 던진다', () => {
+  assert.throws(() => buildMp4({ container: 'mp4', video: { ...video, samples: [] }, audio }), /샘플/);
+  assert.throws(() => buildMp4({ container: 'webm', video, audio }), /컨테이너/);
+});
+
+for (const container of ['mp4', 'mov']) {
+  test(`${container.toUpperCase()}: ffprobe가 h264 160x120 60프레임 + mp3 44100Hz 스테레오 약 2초로 인식하고 디코딩 에러가 없다`, { skip: !FFPROBE || !FFMPEG ? 'ffprobe/ffmpeg 없음' : false }, () => {
+    const path = writeOutput(`out.${container}`, buildMp4({ container, video, audio }));
+    const info = ffprobe(path);
+    const v = info.streams.find(s => s.codec_type === 'video');
+    const a = info.streams.find(s => s.codec_type === 'audio');
+    assert.equal(v.codec_name, 'h264');
+    assert.equal(v.width, 160);
+    assert.equal(v.height, 120);
+    assert.equal(Number(v.nb_read_frames), 60);
+    assert.equal(v.r_frame_rate, '30/1');
+    assert.ok(Math.abs(Number(v.duration) - 2.0) < 0.05, `video duration ${v.duration}`);
+    assert.equal(a.codec_name, 'mp3');
+    assert.equal(Number(a.sample_rate), 44100);
+    assert.equal(a.channels, 2);
+    assert.ok(Math.abs(Number(a.duration) - 2.0) < 0.1, `audio duration ${a.duration}`);
+    assert.ok(Math.abs(Number(info.format.duration) - 2.0) < 0.1, `format duration ${info.format.duration}`);
+    assert.equal(ffmpegDecodeErrors(path), '');
+  });
+}
+
+test('MP4: 오디오가 영상보다 길면 마지막 영상 샘플을 늘려 영상 트랙이 오디오 끝까지 이어진다', () => {
+  const short = { ...video, samples: video.samples.slice(0, 4) }; // 4프레임 ≈ 0.133s, 오디오 2s
+  const file = concatBytes(buildMp4({ container: 'mp4', video: short, audio }));
+  const boxes = parseBoxes(file);
+  const traks = findAllBoxes(findBox(boxes, 'moov').children, 'trak');
+  const stts = readStts(findBox(traks[0].children, 'mdia/minf/stbl').children);
+  const total = stts.reduce((s, e) => s + e.count * e.delta, 0);
+  const audioSamples = audio.frames.reduce((s, f) => s + f.samples, 0) - 1105;
+  const audioDur90k = Math.round(audioSamples * 90000 / audio.sampleRate);
+  assert.ok(Math.abs(total - audioDur90k) <= 2, `video ${total} vs audio ${audioDur90k}`);
+  assert.equal(stts[stts.length - 1].count, 1, '마지막 샘플만 늘어남');
+});

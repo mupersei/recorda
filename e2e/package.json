@@ -1,0 +1,12 @@
+{
+  "name": "recorda-e2e",
+  "private": true,
+  "type": "module",
+  "description": "헤드리스 Chrome(Puppeteer)으로 recorda 확장을 실제 로드해 검증하는 E2E 테스트",
+  "scripts": {
+    "e2e": "node run.mjs"
+  },
+  "devDependencies": {
+    "puppeteer": "^24.0.0"
+  }
+}

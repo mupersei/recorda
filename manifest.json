@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "recorda",
+  "version": "1.1.0",
+  "minimum_chrome_version": "116",
+  "description": "크롬 확장프로그램 녹음/녹화 도구 - 탭 오디오를 MP3/WAV로, 탭 영상+오디오를 MP4/MOV/AVI로 저장합니다",
+  "author": "MuPersei",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "tabCapture",
+    "offscreen",
+    "downloads",
+    "alarms",
+    "storage"
+  ]
+}

@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Recorda - 녹음 도구</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 340px;
+      padding: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+      background: #f5f5f5;
+    }
+
+    .container {
+      background: white;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 20px;
+    }
+
+    .header h1 {
+      font-size: 20px;
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 8px;
+    }
+
+    .status {
+      font-size: 14px;
+      color: #666;
+      margin-bottom: 4px;
+    }
+
+    .status.recording {
+      color: #ff4444;
+      font-weight: 500;
+    }
+
+    .time-display {
+      font-size: 32px;
+      font-weight: 300;
+      color: #333;
+      text-align: center;
+      margin: 24px 0;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 2px;
+    }
+
+    .controls {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    button {
+      padding: 14px;
+      font-size: 16px;
+      font-weight: 500;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    #recordButton {
+      background: #4CAF50;
+      color: white;
+    }
+
+    #recordButton:hover {
+      background: #45a049;
+    }
+
+    #recordButton.recording {
+      background: #ff4444;
+    }
+
+    #recordButton.recording:hover {
+      background: #cc0000;
+    }
+
+    #recordButton.processing {
+      background: #2196F3;
+      cursor: wait;
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    /* 처리 중일 때는 비활성화 상태에서도 파란색 유지 */
+    #recordButton.processing:disabled {
+      background: #2196F3;
+      cursor: wait;
+    }
+
+    @keyframes pulse {
+      0%, 100% {
+        opacity: 1;
+      }
+      50% {
+        opacity: 0.7;
+      }
+    }
+
+    #recordButton:disabled {
+      background: #cccccc;
+      cursor: not-allowed;
+    }
+
+    .message {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      text-align: center;
+      display: none;
+    }
+
+    .message.error {
+      background: #ffebee;
+      color: #c62828;
+      border: 1px solid #ef9a9a;
+    }
+
+    .message.success {
+      background: #e8f5e9;
+      color: #2e7d32;
+      border: 1px solid #a5d6a7;
+    }
+
+    .message.info {
+      background: #e3f2fd;
+      color: #1565c0;
+      border: 1px solid #90caf9;
+    }
+
+    .message.show {
+      display: block;
+    }
+
+    /* [개선] 초기 로딩 시 UI 숨김 - 깜빡임 방지 */
+    .loading-hidden {
+      visibility: hidden;
+      opacity: 0;
+    }
+
+    /* 로딩 완료 후 페이드인 효과 */
+    .loaded {
+      visibility: visible;
+      opacity: 1;
+      transition: opacity 0.15s ease-in-out;
+    }
+
+    /* 스켈레톤 로딩 UI */
+    .skeleton {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+    }
+
+    .skeleton-text {
+      color: #999;
+      font-size: 14px;
+    }
+
+    .footer {
+      margin-top: 16px;
+      text-align: center;
+      font-size: 11px;
+      color: #999;
+    }
+
+    .format-selector {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .format-selector label {
+      font-size: 13px;
+      font-weight: 500;
+      color: #666;
+    }
+
+    .format-selector select {
+      padding: 10px 12px;
+      font-size: 14px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      background: white;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+
+    .format-selector select:hover {
+      border-color: #4CAF50;
+    }
+
+    .format-selector select:focus {
+      outline: none;
+      border-color: #4CAF50;
+      box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.1);
+    }
+
+    .format-selector select:disabled {
+      background: #f5f5f5;
+      cursor: not-allowed;
+      border-color: #e0e0e0;
+      color: #999;
+    }
+
+    .format-selector.hidden {
+      display: none;
+    }
+
+    .hint {
+      font-size: 11px;
+      color: #888;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <!-- [개선] 스켈레톤 로딩 UI -->
+  <div id="skeleton" class="container skeleton">
+    <div class="skeleton-text">로딩 중...</div>
+  </div>
+
+  <!-- [개선] 메인 컨테이너 - 초기 숨김 -->
+  <div id="mainContainer" class="container loading-hidden">
+    <div class="header">
+      <h1>Recorda</h1>
+      <div id="status" class="status">대기 중</div>
+    </div>
+
+    <div id="timeDisplay" class="time-display">00:00</div>
+
+    <div class="controls">
+      <div class="format-selector">
+        <label for="modeSelect">녹화 모드</label>
+        <select id="modeSelect">
+          <option value="AUDIO_ONLY" selected>오디오만 녹음</option>
+          <option value="VIDEO_AUDIO">영상 + 오디오 (파일 1개)</option>
+          <option value="VIDEO_AUDIO_SPLIT">영상 + 오디오, 오디오 별도 저장 (파일 2개)</option>
+        </select>
+      </div>
+
+      <div id="videoFormatGroup" class="format-selector hidden">
+        <label for="videoFormatSelect">영상 포맷</label>
+        <select id="videoFormatSelect">
+          <option value="mp4" selected>MP4 (H.264 + MP3)</option>
+          <option value="mov">MOV (QuickTime)</option>
+          <option value="avi">AVI</option>
+        </select>
+        <div class="hint">영상 파일의 오디오는 선택한 비트레이트의 MP3로 저장됩니다.</div>
+      </div>
+
+      <div id="audioFormatGroup" class="format-selector">
+        <label for="formatSelect">오디오 포맷</label>
+        <select id="formatSelect">
+          <option value="wav" selected>WAV (무손실)</option>
+          <option value="mp3">MP3 (압축)</option>
+        </select>
+      </div>
+
+      <div class="format-selector">
+        <label for="bitrateSelect">MP3 비트레이트</label>
+        <select id="bitrateSelect">
+          <option value="128" selected>128 kbps (표준)</option>
+          <option value="192">192 kbps (고품질)</option>
+          <option value="256">256 kbps (매우 높음)</option>
+          <option value="320">320 kbps (최고품질)</option>
+        </select>
+      </div>
+
+      <div class="format-selector">
+        <label for="sampleRateSelect">샘플레이트</label>
+        <select id="sampleRateSelect">
+          <option value="44100" selected>44.1 kHz (CD 품질)</option>
+          <option value="48000">48 kHz (고품질)</option>
+        </select>
+      </div>
+
+      <button id="recordButton">녹화 시작</button>
+    </div>
+
+    <div id="message" class="message"></div>
+
+    <div class="footer">
+      v1.1.0 | MuPersei
+    </div>
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
