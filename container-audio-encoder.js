@@ -6,10 +6,11 @@ export class ContainerAudioEncoder {
   /**
    * @param {{sampleRate:number, channels:number, bitrateKbps:number}} options
    */
-  constructor({ sampleRate, channels = 2, bitrateKbps = 128 }) {
+  constructor({ sampleRate, channels = 2, bitrateKbps = 128, chunkStore = null }) {
     this.sampleRate = sampleRate;
     this.channels = channels;
     this.bitrateKbps = bitrateKbps;
+    this.chunkStore = chunkStore; // 주어지면 프레임 데이터를 저장소로 보내고 참조만 보관
     this.encoder = null;
     this.splitter = null;
     this.frames = [];
@@ -41,7 +42,17 @@ export class ContainerAudioEncoder {
     const out = this.encoder.encodeBuffer(l, r);
     this.totalSamples += left.length;
     if (out.length > 0) {
-      this.frames.push(...this.splitter.push(new Uint8Array(out.buffer, out.byteOffset, out.length)));
+      this.pushFrames(this.splitter.push(new Uint8Array(out.buffer, out.byteOffset, out.length)));
+    }
+  }
+
+  pushFrames(frames) {
+    for (const f of frames) {
+      if (this.chunkStore) {
+        this.frames.push({ ref: this.chunkStore.append(f.data), samples: f.samples });
+      } else {
+        this.frames.push(f);
+      }
     }
   }
 
@@ -49,24 +60,28 @@ export class ContainerAudioEncoder {
    * 인코딩을 끝내고 머서 입력용 오디오 트랙 설명을 반환
    * @returns {{codec:'mp3', sampleRate:number, channels:number, bitrate:number, frames:Array<{data:Uint8Array, samples:number}>}}
    */
-  finish() {
+  async finish() {
     if (!this.isStarted) {
       throw new Error('ContainerAudioEncoder가 시작되지 않았습니다');
     }
     const tail = this.encoder.flush();
     if (tail.length > 0) {
-      this.frames.push(...this.splitter.push(new Uint8Array(tail.buffer, tail.byteOffset, tail.length)));
+      this.pushFrames(this.splitter.push(new Uint8Array(tail.buffer, tail.byteOffset, tail.length)));
     }
     this.splitter.flush();
     this.isStarted = false;
     this.encoder = null;
+    if (this.chunkStore) {
+      await this.chunkStore.finalize();
+    }
 
     return {
       codec: 'mp3',
       sampleRate: this.sampleRate,
       channels: this.channels,
       bitrate: this.bitrateKbps * 1000,
-      frames: this.frames
+      frames: this.frames,
+      store: this.chunkStore
     };
   }
 }

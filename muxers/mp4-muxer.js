@@ -9,16 +9,19 @@ const MP3_ENCODER_DELAY_SAMPLES = 1105; // LAME: 인코더 576 + 디코더 529
 const UINT32_MAX = 0xFFFFFFFF;
 
 /**
- * MP4 또는 MOV 파일을 생성합니다.
- * @param {Object} options
- * @param {'mp4'|'mov'} options.container
- * @param {{width:number, height:number, avcC:Uint8Array, samples:Array<{data:Uint8Array, timestamp:number, keyframe:boolean}>}} options.video
- *        - timestamp는 마이크로초. 첫 샘플이 원점이 됩니다.
- * @param {{codec:'mp3', sampleRate:number, channels:number, bitrate?:number, frames:Array<{data:Uint8Array, samples:number}>, encoderDelaySamples?:number}|null} [options.audio]
- * @param {Date} [options.creationTime]
- * @returns {Uint8Array[]} 파일 파트 목록 (순서대로 이어 붙이면 완성 파일)
+ * 샘플/프레임의 바이트 크기. 데이터가 메모리에 있으면 data.length, 디스크 저장소 참조면 ref.size
  */
-export function buildMp4({ container = 'mp4', video, audio = null, creationTime = new Date() }) {
+function sampleSize(s) {
+  if (s.data) return s.data.length;
+  if (s.ref) return s.ref.size;
+  throw new Error('샘플에 data 또는 ref가 필요합니다');
+}
+
+/**
+ * 파일 레이아웃 계산 (공통). 샘플 데이터는 읽지 않고 크기만 사용하므로 디스크 저장소 참조만으로도 계산할 수 있습니다.
+ * @returns {{head:Uint8Array, entries:Array<{track:Object, index:number, size:number, source:Object}>, moov:Uint8Array, totalBytes:number}}
+ */
+export function planMp4({ container = 'mp4', video, audio = null, creationTime = new Date() }) {
   if (container !== 'mp4' && container !== 'mov') {
     throw new Error(`지원하지 않는 컨테이너입니다: ${container}`);
   }
@@ -41,25 +44,77 @@ export function buildMp4({ container = 'mp4', video, audio = null, creationTime 
 
   // ---- mdat 배치: 시간순 인터리빙 (각 샘플 = 1 청크) ----
   const entries = [];
-  videoTrack.samples.forEach((s, i) => entries.push({ track: videoTrack, index: i, time: s.dts / VIDEO_TIMESCALE, data: s.data }));
+  videoTrack.samples.forEach((s, i) => entries.push({ track: videoTrack, index: i, time: s.dts / VIDEO_TIMESCALE, size: s.size, source: s.source }));
   if (audioTrack) {
-    audioTrack.samples.forEach((s, i) => entries.push({ track: audioTrack, index: i, time: s.dts / audioTrack.timescale, data: s.data }));
+    audioTrack.samples.forEach((s, i) => entries.push({ track: audioTrack, index: i, time: s.dts / audioTrack.timescale, size: s.size, source: s.source }));
   }
   entries.sort((a, b) => (a.time - b.time) || (a.track === videoTrack ? -1 : 1));
 
-  const mdatPayloadSize = entries.reduce((sum, e) => sum + e.data.length, 0);
+  const mdatPayloadSize = entries.reduce((sum, e) => sum + e.size, 0);
   const ftyp = buildFtyp(isMov);
   const mdatHeader = buildMdatHeader(mdatPayloadSize);
 
   let offset = ftyp.length + mdatHeader.length;
   for (const entry of entries) {
     entry.track.samples[entry.index].offset = offset;
-    offset += entry.data.length;
+    offset += entry.size;
   }
 
   const moov = buildMoov({ isMov, time, videoTrack, audioTrack });
+  const head = new Uint8Array(ftyp.length + mdatHeader.length);
+  head.set(ftyp, 0);
+  head.set(mdatHeader, ftyp.length);
 
-  return [ftyp, mdatHeader, ...entries.map(e => e.data), moov];
+  return { head, entries, moov, totalBytes: head.length + mdatPayloadSize + moov.length };
+}
+
+/**
+ * MP4 또는 MOV 파일을 메모리에서 생성합니다 (샘플 데이터가 메모리에 있을 때).
+ * @param {Object} options
+ * @param {'mp4'|'mov'} options.container
+ * @param {{width:number, height:number, avcC:Uint8Array, samples:Array<{data:Uint8Array, timestamp:number, keyframe:boolean}>}} options.video
+ *        - timestamp는 마이크로초. 첫 샘플이 원점이 됩니다.
+ * @param {{codec:'mp3', sampleRate:number, channels:number, bitrate?:number, frames:Array<{data:Uint8Array, samples:number}>, encoderDelaySamples?:number}|null} [options.audio]
+ * @param {Date} [options.creationTime]
+ * @returns {Uint8Array[]} 파일 파트 목록 (순서대로 이어 붙이면 완성 파일)
+ */
+export function buildMp4(options) {
+  const plan = planMp4(options);
+  const parts = [plan.head];
+  for (const e of plan.entries) {
+    if (!e.source.data) throw new Error('buildMp4는 메모리 샘플(data)만 지원합니다. 저장소 참조는 writeMp4를 사용하세요.');
+    parts.push(e.source.data);
+  }
+  parts.push(plan.moov);
+  return parts;
+}
+
+/**
+ * MP4 또는 MOV 파일을 출력 싱크에 스트리밍으로 씁니다. 샘플 데이터가 디스크 저장소(ChunkStore)에 있어도
+ * 한 번에 한 샘플만 읽으므로 메모리 사용량이 파일 크기와 무관합니다.
+ * video.samples[i] / audio.frames[i]는 { data } 또는 { ref:{offset,size} } 중 하나를 가지며, 참조인 경우
+ * video.store / audio.store (finalize된 ChunkStore)에서 읽습니다.
+ * @returns {Promise<{blob:Blob, bytes:number}>}
+ */
+export async function writeMp4({ output, ...options }) {
+  if (!output || typeof output.write !== 'function') {
+    throw new Error('출력 싱크(output)가 필요합니다');
+  }
+  const plan = planMp4(options);
+  await output.write(plan.head);
+  for (const e of plan.entries) {
+    await output.write(await readSource(e.source));
+  }
+  await output.write(plan.moov);
+  const blob = await output.close();
+  return { blob, bytes: plan.totalBytes };
+}
+
+/** 샘플 소스를 쓰기 가능한 데이터로 (메모리 데이터 또는 저장소 Blob 조각) */
+async function readSource(source) {
+  if (source.data) return source.data;
+  if (!source.store) throw new Error('저장소 참조 샘플에는 store가 필요합니다');
+  return source.store.slice(source.ref.offset, source.ref.size);
 }
 
 // ---- 트랙 준비 ----
@@ -90,7 +145,8 @@ function prepareVideoTrack(video, audioTrack) {
     if (audioEnd > videoEnd) durations[last] += audioEnd - videoEnd;
   }
   const samples = video.samples.map((s, i) => ({
-    data: s.data,
+    size: sampleSize(s),
+    source: { data: s.data, ref: s.ref, store: video.store },
     dts: dtsList[i],
     duration: durations[i],
     keyframe: !!s.keyframe,
@@ -112,7 +168,7 @@ function prepareVideoTrack(video, audioTrack) {
 function prepareAudioTrack(audio) {
   let dts = 0;
   const samples = audio.frames.map((f) => {
-    const sample = { data: f.data, dts, duration: f.samples, keyframe: true, offset: 0 };
+    const sample = { size: sampleSize(f), source: { data: f.data, ref: f.ref, store: audio.store }, dts, duration: f.samples, keyframe: true, offset: 0 };
     dts += f.samples;
     return sample;
   });
@@ -132,7 +188,7 @@ function prepareAudioTrack(audio) {
 }
 
 function estimateBitrate(audio) {
-  const bytes = audio.frames.reduce((s, f) => s + f.data.length, 0);
+  const bytes = audio.frames.reduce((s, f) => s + sampleSize(f), 0);
   const samples = audio.frames.reduce((s, f) => s + f.samples, 0);
   return samples > 0 ? Math.round(bytes * 8 * audio.sampleRate / samples) : 128000;
 }
@@ -326,13 +382,13 @@ function buildStbl({ isMov, track }) {
   parts.push(fullBox('stsc', 0, 0, payload((w) => { w.u32be(1).u32be(1).u32be(1).u32be(1); })));
 
   // stsz
-  const allSame = samples.every(s => s.data.length === samples[0].data.length);
+  const allSame = samples.every(s => s.size === samples[0].size);
   parts.push(fullBox('stsz', 0, 0, payload((w) => {
     if (allSame) {
-      w.u32be(samples[0].data.length).u32be(samples.length);
+      w.u32be(samples[0].size).u32be(samples.length);
     } else {
       w.u32be(0).u32be(samples.length);
-      for (const s of samples) w.u32be(s.data.length);
+      for (const s of samples) w.u32be(s.size);
     }
   }, 8 + samples.length * 4)));
 

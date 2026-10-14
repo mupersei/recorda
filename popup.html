@@ -12,8 +12,8 @@
     }
 
     body {
-      width: 340px;
-      padding: 20px;
+      width: 360px;
+      padding: 12px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
       background: #f5f5f5;
     }
@@ -21,26 +21,26 @@
     .container {
       background: white;
       border-radius: 12px;
-      padding: 24px;
+      padding: 16px 18px;
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
     }
 
     .header {
-      text-align: center;
-      margin-bottom: 20px;
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 4px;
     }
 
     .header h1 {
-      font-size: 20px;
+      font-size: 18px;
       font-weight: 600;
       color: #333;
-      margin-bottom: 8px;
     }
 
     .status {
-      font-size: 14px;
+      font-size: 13px;
       color: #666;
-      margin-bottom: 4px;
     }
 
     .status.recording {
@@ -49,24 +49,36 @@
     }
 
     .time-display {
-      font-size: 32px;
+      font-size: 30px;
       font-weight: 300;
       color: #333;
       text-align: center;
-      margin: 24px 0;
+      margin: 6px 0 10px;
       font-variant-numeric: tabular-nums;
       letter-spacing: 2px;
+      line-height: 1.1;
     }
 
     .controls {
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: 8px;
+    }
+
+    /* 두 개의 선택 항목을 한 줄에 배치. 한쪽이 숨겨지면 남은 쪽이 전체 폭을 차지 */
+    .row {
+      display: flex;
+      gap: 8px;
+    }
+
+    .row > .format-selector {
+      flex: 1 1 0;
+      min-width: 0;
     }
 
     button {
-      padding: 14px;
-      font-size: 16px;
+      padding: 11px;
+      font-size: 15px;
       font-weight: 500;
       border: none;
       border-radius: 8px;
@@ -118,10 +130,13 @@
     }
 
     .message {
-      margin-top: 12px;
-      padding: 12px;
+      margin-top: 8px;
+      padding: 8px 10px;
       border-radius: 6px;
-      font-size: 13px;
+      font-size: 12px;
+      line-height: 1.35;
+      word-break: keep-all;
+      overflow-wrap: anywhere;
       text-align: center;
       display: none;
     }
@@ -176,27 +191,28 @@
     }
 
     .footer {
-      margin-top: 16px;
+      margin-top: 8px;
       text-align: center;
-      font-size: 11px;
-      color: #999;
+      font-size: 10px;
+      color: #aaa;
     }
 
     .format-selector {
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 3px;
     }
 
     .format-selector label {
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 500;
       color: #666;
     }
 
     .format-selector select {
-      padding: 10px 12px;
-      font-size: 14px;
+      width: 100%;
+      padding: 6px 8px;
+      font-size: 13px;
       border: 1px solid #ddd;
       border-radius: 6px;
       background: white;
@@ -221,14 +237,14 @@
       color: #999;
     }
 
-    .format-selector.hidden {
-      display: none;
+    .hidden {
+      display: none !important;
     }
 
     .hint {
-      font-size: 11px;
+      font-size: 10px;
       color: #888;
-      line-height: 1.4;
+      line-height: 1.3;
     }
   </style>
 </head>
@@ -257,41 +273,46 @@
         </select>
       </div>
 
-      <div id="videoFormatGroup" class="format-selector hidden">
-        <label for="videoFormatSelect">영상 포맷</label>
-        <select id="videoFormatSelect">
-          <option value="mp4" selected>MP4 (H.264 + MP3)</option>
-          <option value="mov">MOV (QuickTime)</option>
-          <option value="avi">AVI</option>
-        </select>
-        <div class="hint">영상 파일의 오디오는 선택한 비트레이트의 MP3로 저장됩니다.</div>
+      <div class="row">
+        <div id="videoFormatGroup" class="format-selector hidden">
+          <label for="videoFormatSelect">영상 포맷</label>
+          <select id="videoFormatSelect" title="영상 파일의 오디오는 선택한 비트레이트의 MP3로 저장됩니다">
+            <option value="mp4" selected>MP4</option>
+            <option value="mov">MOV</option>
+            <option value="avi">AVI</option>
+          </select>
+        </div>
+
+        <div id="audioFormatGroup" class="format-selector">
+          <label for="formatSelect">오디오 포맷</label>
+          <select id="formatSelect">
+            <option value="wav" selected>WAV (무손실)</option>
+            <option value="mp3">MP3 (압축)</option>
+          </select>
+        </div>
       </div>
 
-      <div id="audioFormatGroup" class="format-selector">
-        <label for="formatSelect">오디오 포맷</label>
-        <select id="formatSelect">
-          <option value="wav" selected>WAV (무손실)</option>
-          <option value="mp3">MP3 (압축)</option>
-        </select>
+      <div class="row">
+        <div class="format-selector">
+          <label for="bitrateSelect">MP3 비트레이트</label>
+          <select id="bitrateSelect">
+            <option value="128" selected>128 kbps</option>
+            <option value="192">192 kbps</option>
+            <option value="256">256 kbps</option>
+            <option value="320">320 kbps</option>
+          </select>
+        </div>
+
+        <div class="format-selector">
+          <label for="sampleRateSelect">샘플레이트</label>
+          <select id="sampleRateSelect">
+            <option value="44100" selected>44.1 kHz (CD)</option>
+            <option value="48000">48 kHz</option>
+          </select>
+        </div>
       </div>
 
-      <div class="format-selector">
-        <label for="bitrateSelect">MP3 비트레이트</label>
-        <select id="bitrateSelect">
-          <option value="128" selected>128 kbps (표준)</option>
-          <option value="192">192 kbps (고품질)</option>
-          <option value="256">256 kbps (매우 높음)</option>
-          <option value="320">320 kbps (최고품질)</option>
-        </select>
-      </div>
-
-      <div class="format-selector">
-        <label for="sampleRateSelect">샘플레이트</label>
-        <select id="sampleRateSelect">
-          <option value="44100" selected>44.1 kHz (CD 품질)</option>
-          <option value="48000">48 kHz (고품질)</option>
-        </select>
-      </div>
+      <div id="videoHint" class="hint hidden">영상은 H.264, 영상 파일의 오디오는 선택한 비트레이트의 MP3로 저장됩니다.</div>
 
       <button id="recordButton">녹화 시작</button>
     </div>

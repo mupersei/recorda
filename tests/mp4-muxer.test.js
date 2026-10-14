@@ -180,3 +180,55 @@ test('MP4: 오디오가 영상보다 길면 마지막 영상 샘플을 늘려 �
   assert.ok(Math.abs(total - audioDur90k) <= 2, `video ${total} vs audio ${audioDur90k}`);
   assert.equal(stts[stts.length - 1].count, 1, '마지막 샘플만 늘어남');
 });
+
+// ---- 스트리밍 쓰기 (디스크 저장소 참조 기반) ----
+import { writeMp4 } from '../muxers/mp4-muxer.js';
+import { MemoryChunkStore, MemoryFileSink, OpfsChunkStore, OpfsFileSink } from '../storage/chunk-store.js';
+import { FakeDirectoryHandle } from './helpers/fake-opfs.js';
+
+async function toStoreBacked(makeStore) {
+  const vStore = makeStore('video.bin');
+  const aStore = makeStore('audio.bin');
+  const storedVideo = { ...video, store: vStore, samples: video.samples.map(s => ({ ref: vStore.append(s.data), timestamp: s.timestamp, keyframe: s.keyframe })) };
+  const storedAudio = { ...audio, store: aStore, frames: audio.frames.map(f => ({ ref: aStore.append(f.data), samples: f.samples })) };
+  await vStore.finalize();
+  await aStore.finalize();
+  return { storedVideo, storedAudio };
+}
+
+for (const container of ['mp4', 'mov']) {
+  test(`${container.toUpperCase()}: 저장소 참조 샘플로 스트리밍 작성한 결과가 메모리 buildMp4 결과와 바이트 단위로 같다`, async () => {
+    const expected = concatBytes(buildMp4({ container, video, audio, creationTime: new Date(2026, 0, 1) }));
+    const { storedVideo, storedAudio } = await toStoreBacked(() => new MemoryChunkStore());
+    const sink = new MemoryFileSink(container === 'mov' ? 'video/quicktime' : 'video/mp4');
+    const result = await writeMp4({ container, video: storedVideo, audio: storedAudio, output: sink, creationTime: new Date(2026, 0, 1) });
+    const actual = new Uint8Array(await result.blob.arrayBuffer());
+    assert.equal(actual.length, expected.length);
+    assert.deepEqual(Buffer.from(actual).compare(Buffer.from(expected)), 0, '바이트 불일치');
+    assert.equal(result.bytes, expected.length);
+  });
+}
+
+test('MP4: OPFS(가짜) 저장소 + OPFS 싱크로도 동일한 파일이 만들어진다', async () => {
+  const root = new FakeDirectoryHandle();
+  const expected = concatBytes(buildMp4({ container: 'mp4', video, audio, creationTime: new Date(2026, 0, 1) }));
+  const { storedVideo, storedAudio } = await toStoreBacked((name) => new OpfsChunkStore(root, name, { bufferBytes: 4096 }));
+  const sink = new OpfsFileSink(root, 'out.mp4', 'video/mp4');
+  const result = await writeMp4({ container: 'mp4', video: storedVideo, audio: storedAudio, output: sink, creationTime: new Date(2026, 0, 1) });
+  const actual = new Uint8Array(await result.blob.arrayBuffer());
+  assert.deepEqual(Buffer.from(actual).compare(Buffer.from(expected)), 0);
+  assert.equal(result.blob.type, 'video/mp4');
+});
+
+test('MP4: 스트리밍 작성은 샘플 데이터를 한꺼번에 메모리에 올리지 않는다 (한 번에 읽는 최대 크기 ≤ 가장 큰 샘플 + 여유)', async () => {
+  const { storedVideo, storedAudio } = await toStoreBacked(() => new MemoryChunkStore());
+  let maxRead = 0;
+  for (const st of [storedVideo.store, storedAudio.store]) {
+    const orig = st.slice.bind(st);
+    st.slice = async (o, s) => { maxRead = Math.max(maxRead, s); return orig(o, s); };
+  }
+  const sink = new MemoryFileSink('video/mp4');
+  await writeMp4({ container: 'mp4', video: storedVideo, audio: storedAudio, output: sink });
+  const biggest = Math.max(...video.samples.map(s => s.data.length));
+  assert.ok(maxRead <= biggest, `maxRead=${maxRead}`);
+});

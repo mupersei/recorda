@@ -171,3 +171,34 @@ test('AVI: 오디오가 영상보다 길면 빈 영상 청크를 덧붙여 dwTot
   assert.equal(videoChunks.length, totalFrames);
   assert.ok(videoChunks.slice(4).every(c => c.size === 0));
 });
+
+// ---- 스트리밍 쓰기 (디스크 저장소 참조 기반) ----
+import { writeAvi, countNalUnits } from '../muxers/avi-muxer.js';
+import { MemoryChunkStore, MemoryFileSink } from '../storage/chunk-store.js';
+
+test('countNalUnits는 길이 접두 AVC 샘플의 NAL 개수를 센다', () => {
+  const sample = new Uint8Array([0, 0, 0, 2, 0x65, 1, 0, 0, 0, 3, 0x41, 2, 3]);
+  assert.equal(countNalUnits(sample, 4), 2);
+});
+
+test('AVI: 저장소 참조 샘플(AVC 형식 + nalCount)로 스트리밍 작성한 결과가 메모리 buildAvi 결과와 바이트 단위로 같다', async () => {
+  const expected = concatBytes(buildAvi({ video, audio, frameRate: 30 }));
+  const vStore = new MemoryChunkStore();
+  const aStore = new MemoryChunkStore();
+  const storedVideo = { ...video, store: vStore, samples: video.samples.map(s => ({ ref: vStore.append(s.data), nalCount: countNalUnits(s.data, 4), timestamp: s.timestamp, keyframe: s.keyframe })) };
+  const storedAudio = { ...audio, store: aStore, frames: audio.frames.map(f => ({ ref: aStore.append(f.data), samples: f.samples })) };
+  await vStore.finalize();
+  await aStore.finalize();
+  const sink = new MemoryFileSink('video/x-msvideo');
+  const result = await writeAvi({ video: storedVideo, audio: storedAudio, frameRate: 30, output: sink });
+  const actual = new Uint8Array(await result.blob.arrayBuffer());
+  assert.equal(actual.length, expected.length, `길이 ${actual.length} vs ${expected.length}`);
+  assert.equal(Buffer.from(actual).compare(Buffer.from(expected)), 0, '바이트 불일치');
+});
+
+test('AVI: 스트리밍 작성 시 예상 크기가 2GB를 넘으면 쓰기 전에 에러를 던진다', async () => {
+  const vStore = new MemoryChunkStore();
+  const big = { ...video, store: vStore, samples: [{ ref: { offset: 0, size: 2.5 * 1024 * 1024 * 1024 }, nalCount: 1, timestamp: 0, keyframe: true }] };
+  await vStore.finalize();
+  await assert.rejects(() => writeAvi({ video: big, audio: null, frameRate: 30, output: new MemoryFileSink('video/x-msvideo') }), /2GB/);
+});

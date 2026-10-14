@@ -1,8 +1,9 @@
 import { MESSAGE_TYPES, ERROR_MESSAGES, SETTINGS, VIDEO_SETTINGS } from './constants.js';
-import { StreamingMp3Encoder, StreamingWavEncoder } from './encoders.js';
+import { WavFileEncoder, Mp3FileEncoder } from './audio-file-encoders.js';
 import { generateRecordingFilenames } from './utils.js';
 import { resolveRecordingPlan } from './recording-plan.js';
 import { VideoRecordingSession } from './video-recorder.js';
+import { createRecordingStorage, cleanupStaleRecordings } from './storage/chunk-store.js';
 
 // 전역 변수
 let audioContext = null;
@@ -18,6 +19,7 @@ let videoSession = null;       // 영상(+컨테이너 오디오) 세션
 let audioWorkletNode = null;
 let heartbeatTimer = null;     // Background SW 유휴 종료 방지 + 상태 복구용 하트비트
 let heartbeatPayload = null;
+let recordingStorage = null;   // 녹화 데이터 저장소 (OPFS 디스크, 폴백: 메모리)
 let stopping = false;          // 중복 중지 방지 (STOP_CAPTURE와 트랙 종료가 동시에 올 수 있음)
 let isCapturing = false;
 
@@ -63,6 +65,14 @@ async function handleStartCapture(data, sendResponse) {
     recordingSampleRate = sampleRate || 44100;
     heartbeatPayload = { tabId: tabId ?? null, startTime: startTime ?? Date.now(), plan: recordingPlan, format: recordingPlan.outputs.find(o => o.kind === 'audio')?.format || format };
     stopping = false;
+
+    // 녹화 데이터 저장소: 인코딩 결과를 메모리 대신 디스크(OPFS)에 두어 장시간 녹화에서도 메모리가 늘지 않게 함
+    const storageManager = (typeof navigator !== 'undefined' && navigator.storage) ? navigator.storage : null;
+    const sessionId = `rec-${Date.now()}`;
+    recordingStorage = await createRecordingStorage(storageManager, sessionId);
+    console.log('[Offscreen] 녹화 저장소:', recordingStorage.kind);
+    // 이전 녹화의 임시 파일 정리 (다운로드가 끝난 뒤 남아 있던 것)
+    cleanupStaleRecordings(storageManager, sessionId).then((n) => { if (n) console.log('[Offscreen] 이전 녹화 임시 파일 정리:', n, '개'); });
 
     console.log('[Offscreen] 녹화 계획:', recordingPlan);
 
@@ -240,13 +250,15 @@ function setupLoopback(mediaStream) {
   }
 }
 
-// 오디오 단독 파일용 인코더 생성
-function createAudioFileEncoder(format, channels, sampleRate) {
+// 오디오 단독 파일용 인코더 생성 (결과를 디스크 싱크에 바로 기록)
+async function createAudioFileEncoder(format, channels, sampleRate) {
   if (format === 'mp3') {
-    return new StreamingMp3Encoder(channels, sampleRate, recordingBitrate);
+    const sink = await recordingStorage.createFileSink('audio.mp3', 'audio/mpeg');
+    return new Mp3FileEncoder({ sampleRate, channels, bitrateKbps: recordingBitrate, sink });
   }
   if (format === 'wav') {
-    return new StreamingWavEncoder(channels, sampleRate);
+    const sink = await recordingStorage.createFileSink('audio.wav', 'audio/wav');
+    return new WavFileEncoder({ sampleRate, channels, sink });
   }
   throw new Error(`지원하지 않는 포맷: ${format}`);
 }
@@ -271,7 +283,7 @@ async function startStreamingRecording(mediaStream, videoTrack) {
     // 1) 오디오 단독 파일 인코더 (AUDIO_ONLY, VIDEO_AUDIO_SPLIT)
     const audioOutput = recordingPlan.outputs.find(o => o.kind === 'audio');
     if (audioOutput) {
-      streamingEncoder = createAudioFileEncoder(audioOutput.format, channels, sampleRate);
+      streamingEncoder = await createAudioFileEncoder(audioOutput.format, channels, sampleRate);
       await streamingEncoder.start();
       console.log('[StreamingRecording] 오디오 파일 인코더 시작:', audioOutput.format, { channels, sampleRate, bitrate: recordingBitrate });
     }
@@ -287,7 +299,8 @@ async function startStreamingRecording(mediaStream, videoTrack) {
         videoTrack,
         sampleRate,
         channels,
-        bitrateKbps: recordingBitrate
+        bitrateKbps: recordingBitrate,
+        storage: recordingStorage
       });
       console.log('[StreamingRecording] 영상 세션 준비:', videoOutput.format);
     }
@@ -424,6 +437,7 @@ async function handleStreamingRecordingStop() {
         success: true,
         files,
         warning,
+        storage: recordingStorage ? recordingStorage.kind : 'memory',
         // 하위 호환 필드
         format: files[0]?.format,
         size: files.reduce((s, f) => s + f.size, 0)

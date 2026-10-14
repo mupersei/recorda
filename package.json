@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Recorda Chrome Extension - 탭 오디오/영상 녹화",
   "scripts": {
-    "test": "node --test --test-timeout=30000 tests/*.test.js",
-    "test:e2e": "cd e2e && npm install --no-audit --no-fund && node run.mjs"
+    "test": "node --test --test-concurrency=1 --test-timeout=60000 tests/*.test.js",
+    "test:e2e": "cd e2e && npm install --no-audit --no-fund && node run.mjs",
+    "test:popup": "cd e2e && node --test popup-layout.test.mjs"
   }
 }

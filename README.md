@@ -69,6 +69,21 @@ popup.js ──START_RECORDING──▶ background.js ──START_CAPTURE──�
 - 녹화 중 탭 크기가 바뀌어도 파일 해상도는 첫 프레임 크기로 고정됩니다(파일당 하나의 `avcC`). 비율이 같으면 Chrome `VideoEncoder`가
   스케일링하고, 비율이 바뀐 경우(창 모양 변경)에만 OffscreenCanvas 레터박스로 정규화합니다.
 
+### 장시간 녹화: 디스크 스트리밍 저장소
+
+인코딩된 데이터는 메모리가 아니라 Origin Private File System(OPFS, `navigator.storage.getDirectory()`)에 기록됩니다.
+
+- `storage/chunk-store.js`: 녹화 중 영상 H.264 청크와 컨테이너용 MP3 프레임은 `OpfsChunkStore`에 append(1 MB 버퍼)되고, 메모리에는
+  오프셋·크기·타임스탬프 같은 메타데이터만 남습니다(1080p 1시간 ≈ 10만 샘플, 수십 MB).
+- 중지 시 머서(`writeMp4` / `writeAvi`)가 레이아웃을 계산한 뒤 디스크의 청크를 한 샘플씩 읽어 결과 파일(OPFS)에 스트리밍으로 씁니다.
+  메모리 방식(`buildMp4` / `buildAvi`)과 바이트 단위로 같은 파일을 만든다는 것을 테스트로 보장합니다.
+- 오디오 단독 파일도 `WavFileEncoder` / `Mp3FileEncoder`가 디스크 싱크에 바로 기록합니다(WAV는 종료 시 헤더만 패치).
+- 결과 파일은 OPFS의 `File`로 다운로드되므로 `Blob` 복사가 없습니다. 임시 파일은 다음 녹화 시작 시 정리됩니다.
+- OPFS를 쓸 수 없는 환경에서는 자동으로 메모리 저장소로 폴백합니다.
+
+이 구조 이전에는 1080p 기준 분당 약 27 MB가 RAM에 쌓이고 분리 저장의 WAV는 종료 시 전체를 메모리에 다시 올려,
+1시간 20분 전후로 수 GB에 도달해 탭이 멈추는 문제가 있었습니다.
+
 ### Service Worker 수명 대응
 
 MV3 Service Worker는 유휴 30초 후 종료될 수 있고, 패키지 설치에서는 `chrome.alarms` 최소 주기가 30초입니다.
@@ -105,6 +120,9 @@ cd e2e && node run.mjs --duration=10 --long=60 --only=video-mp4,split-avi-wav
 - `chrome.tabCapture.getMediaStreamId`는 사용자의 확장 아이콘 클릭이 있어야만 동작하므로 자동화할 수 없습니다. 하네스는 Service Worker에서
   이 호출과 Offscreen 생성 API만 스텁하고, `offscreen.html`을 탭으로 열어 `getUserMedia`를 캔버스(영상)+오실레이터(오디오) 스트림으로 대체합니다.
   팝업 → Background → Offscreen → WebCodecs 인코딩 → 머싱 → `chrome.downloads` 저장까지는 모두 실제 코드가 실행됩니다.
+- 팝업 레이아웃 테스트: `npm run test:popup`. 실제 Chrome에서 popup.html을 열어 모든 모드·상태(완료 메시지, 시:분:초 표시 포함)에서
+  콘텐츠 높이가 Chrome 팝업 최대 높이(600px) 이내라 스크롤이 생기지 않는지, 선택 상자 텍스트가 잘리지 않는지 검사합니다.
+  현재 높이: 오디오만 353px, 영상+오디오 374px, 분리 저장 416px.
 - 시나리오: 오디오만(mp3/wav), 영상+오디오(mp4/mov/avi), 분리 저장(mp4+mp3, avi+wav), 녹화 중 탭 크기 변경, 1080p 60초 장시간 녹화.
   각 파일은 ffprobe 스트림 정보, 전체 디코딩, 프레임 타임스탬프 단조성, A/V 길이 차, 파일명 규칙을 검사하고
   녹화 중 CPU/메모리(PSS, offscreen JS 힙)를 1초 간격으로 측정해 `e2e/output/report.json`에 남깁니다.
@@ -129,7 +147,7 @@ E2E 하네스의 합산 수치(`e2e/output/report.json`)에는 테스트용 가�
 - 실제 사용 시 합계는 오디오만 약 25%, 720p 영상+오디오 약 80%, 1080p 영상+오디오 약 105%(소프트웨어 인코딩 기준)입니다.
   하드웨어 인코더가 있는 PC에서는 영상 인코딩 CPU가 크게 낮아집니다.
 - MP3 인코딩(lamejs, 순수 JS)이 오디오 쪽 CPU의 대부분입니다. WAV는 변환이 거의 없어 10% 미만입니다.
-- 장시간 녹화에서 실제로 늘어나는 항목은 청크 보관(1080p 1시간 ≈ 1.6 GB)과 중지 시 Blob 복사뿐입니다. 나머지는 고정 비용입니다.
+- 디스크 스트리밍 저장소 도입 후에는 청크 보관과 중지 시 Blob 복사가 사라져, 녹화 길이에 비례해 늘어나는 메모리 항목은 샘플 메타데이터뿐입니다.
 
 ### 모드 × 확장자별 전체 파이프라인 비용 (720p 30fps, 15초 녹화, 조합마다 새 브라우저에서 3회 측정, 중앙값과 범위)
 
@@ -177,7 +195,8 @@ E2E 하네스의 합산 수치(`e2e/output/report.json`)에는 테스트용 가�
 
 ## 알려진 제한
 
-- 영상 인코딩 결과는 메모리에 유지되므로 매우 긴 녹화(수 시간)는 메모리를 많이 사용합니다.
+- 녹화 데이터는 OPFS(브라우저 프로필 디스크)에 기록되므로 긴 녹화는 그만큼의 디스크 여유 공간이 필요합니다(1080p 약 1.6 GB/시간).
+- WAV 파일은 RIFF 한계로 4 GB(48 kHz 스테레오 약 6시간)를 넘을 수 없으며, 2 GB를 넘으면 일부 플레이어가 열지 못합니다.
 - AVI는 RIFF 32비트 한계 때문에 2GB를 넘을 수 없습니다. 초과가 예상되면 자동으로 MP4로 저장하고 안내합니다.
 - 영상 파일의 오디오는 항상 MP3입니다(AAC 미지원). 오디오 포맷 선택은 별도 저장되는 오디오 파일에만 적용됩니다.
 - Chrome `<video>`는 AVI를 재생하지 않습니다(VLC, mpv, Windows 미디어 플레이어 등에서 재생).

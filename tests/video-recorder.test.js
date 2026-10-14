@@ -126,13 +126,13 @@ test('VideoTrackEncoder는 인코더 에러를 stop()에서 전달한다', async
   await assert.rejects(() => encoder.stop(), /가짜 인코더 오류/);
 });
 
-test('ContainerAudioEncoder는 Float32 PCM을 MP3 프레임(1152 샘플)으로 인코딩한다', () => {
+test('ContainerAudioEncoder는 Float32 PCM을 MP3 프레임(1152 샘플)으로 인코딩한다', async () => {
   const enc = new ContainerAudioEncoder({ sampleRate: 44100, channels: 2, bitrateKbps: 128 });
   enc.start();
   const l = new Float32Array(4096).map((_, i) => Math.sin(i / 7) * 0.5);
   const r = new Float32Array(4096).map((_, i) => Math.cos(i / 7) * 0.5);
   for (let i = 0; i < 12; i++) enc.processChunk(l, r);
-  const audio = enc.finish();
+  const audio = await enc.finish();
   assert.equal(audio.codec, 'mp3');
   assert.equal(audio.sampleRate, 44100);
   assert.equal(audio.channels, 2);
@@ -262,4 +262,109 @@ test('VideoTrackEncoder는 가로세로 비율이 같은 크기 변화는 정규
   assert.equal(encoder.normalizedFrames, 0);
   assert.equal(encoder.scaledFrames, 1, '인코더 스케일링에 맡긴 프레임 수');
   assert.equal(instances[0].encoded[1].timestamp, 33_333);
+});
+
+// ---- 디스크 저장소(ChunkStore) 연동 ----
+import { MemoryChunkStore, createRecordingStorage } from '../storage/chunk-store.js';
+
+class CountingStore {
+  constructor() { this.size = 0; this.appends = 0; this.finalized = false; this.retainedBytes = 0; }
+  get kind() { return 'counting'; }
+  append(data) { const ref = { offset: this.size, size: data.length }; this.size += data.length; this.appends++; return ref; }
+  async flush() {}
+  async finalize() { this.finalized = true; }
+  async readRange() { throw new Error('not needed'); }
+  async slice() { throw new Error('not needed'); }
+  async dispose() {}
+}
+
+test('VideoTrackEncoder는 chunkStore가 주어지면 청크 데이터를 저장소에 넘기고 참조(ref)와 nalCount만 보관한다', async () => {
+  const store = new CountingStore();
+  const reader = new FakeReader(frames(5));
+  const { FakeVideoEncoder } = makeFakeVideoEncoder();
+  const encoder = new VideoTrackEncoder({ track: {}, chunkStore: store, deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => 0 } });
+  await encoder.start();
+  await tick();
+  const result = await encoder.stop();
+  assert.equal(result.samples.length, 5);
+  assert.ok(result.samples.every(s => !s.data && s.ref && typeof s.ref.offset === 'number' && s.ref.size === 6), JSON.stringify(result.samples[0]));
+  assert.ok(result.samples.every(s => s.nalCount === 1), '가짜 청크는 NAL 1개');
+  assert.deepEqual(result.samples.map(s => s.ref.offset), [0, 6, 12, 18, 24]);
+  assert.equal(store.appends, 5);
+  assert.equal(store.finalized, true, 'stop 시 저장소 finalize');
+  assert.equal(result.store, store);
+  assert.equal(encoder.retainedBytes, 0, '인코더가 청크 데이터를 보유하지 않음');
+});
+
+test('VideoTrackEncoder는 저장소 없이 쓰면 기존처럼 data를 보관한다 (호환)', async () => {
+  const { encoder } = makeEncoder({ frameList: frames(2) });
+  await encoder.start();
+  await tick();
+  const { samples } = await encoder.stop();
+  assert.ok(samples.every(s => s.data instanceof Uint8Array && !s.ref));
+  assert.equal(encoder.retainedBytes, 12);
+});
+
+test('ContainerAudioEncoder는 chunkStore가 주어지면 MP3 프레임을 저장소에 넘기고 참조만 보관한다', async () => {
+  const store = new MemoryChunkStore();
+  const enc = new ContainerAudioEncoder({ sampleRate: 44100, channels: 2, bitrateKbps: 128, chunkStore: store });
+  enc.start();
+  const l = new Float32Array(4096).fill(0.1), r = new Float32Array(4096).fill(-0.1);
+  for (let i = 0; i < 6; i++) enc.processChunk(l, r);
+  const audio = await enc.finish();
+  assert.ok(audio.frames.length > 10);
+  assert.ok(audio.frames.every(f => !f.data && f.ref && f.samples === 1152));
+  assert.equal(audio.store, store);
+  assert.equal(store.finalized, true);
+  const first = await store.readRange(audio.frames[0].ref.offset, 2);
+  assert.equal(first[0], 0xFF, 'MP3 프레임 싱크');
+});
+
+for (const format of ['mp4', 'mov', 'avi']) {
+  test(`VideoRecordingSession(${format})은 storage가 주어지면 저장소 참조로 스트리밍 머싱해 올바른 파일을 만든다`, async () => {
+    const storage = await createRecordingStorage(null, 'sess');
+    const reader = new FakeReader(frames(10));
+    const { FakeVideoEncoder } = makeFakeVideoEncoder();
+    const session = new VideoRecordingSession({ format, videoTrack: {}, sampleRate: 44100, bitrateKbps: 128, storage, deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => 0 } });
+    await session.start();
+    const l = new Float32Array(4096).fill(0.1), r = new Float32Array(4096).fill(-0.1);
+    for (let i = 0; i < 6; i++) session.pushAudio(l, r);
+    await tick();
+    const blob = await session.stop();
+    const head = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+    const ascii = (a, b) => String.fromCharCode(...head.subarray(a, b));
+    if (format === 'avi') assert.equal(ascii(8, 12), 'AVI ');
+    else assert.equal(ascii(4, 8), 'ftyp');
+    assert.equal(session.stats.bytes, blob.size);
+    assert.equal(session.videoEncoder.retainedBytes, 0, '영상 청크를 메모리에 보유하지 않음');
+  });
+}
+
+test('VideoTrackEncoder(chunkStore)는 장시간(약 55분 분량) 청크를 밀어 넣어도 메모리 보유량이 메타데이터 수준에 머문다', async () => {
+  // 가짜 인코더가 1080p 수준(25KB) 청크를 100,000개(약 55분×30fps, 2.5GB 상당) 내도록 하되, 저장소는 바이트를 세기만 함
+  const store = new CountingStore();
+  const frameCount = 100_000;
+  const bigChunk = new Uint8Array(25_000);
+  class BigEncoder {
+    static async isConfigSupported(c) { return { supported: true, config: c }; }
+    constructor({ output }) { this.output = output; this.encodeQueueSize = 0; this.state = 'unconfigured'; this.n = 0; }
+    configure() { this.state = 'configured'; }
+    encode(frame, opts) { const key = !!opts.keyFrame; const meta = this.n === 0 ? { decoderConfig: { description: FAKE_AVCC } } : {}; this.n++; this.output({ type: key ? 'key' : 'delta', timestamp: frame.timestamp, byteLength: bigChunk.length, copyTo: (d) => d.set(bigChunk) }, meta); }
+    async flush() {} close() { this.state = 'closed'; }
+  }
+  // 리더: 프레임을 즉시 생성(메모리에 쌓지 않음)
+  let produced = 0;
+  const reader = { read: async () => (produced < frameCount ? { done: false, value: new FakeVideoFrame({ timestamp: produced++ * 33_333 }) } : { done: true }), cancel: async () => {} };
+  const encoder = new VideoTrackEncoder({ track: {}, chunkStore: store, deps: { VideoEncoder: BigEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => 0 } });
+  const before = process.memoryUsage().heapUsed;
+  await encoder.start();
+  // 읽기 루프가 끝날 때까지 대기
+  while (!encoder.ended) await new Promise(r => setTimeout(r, 20));
+  const result = await encoder.stop();
+  const after = process.memoryUsage().heapUsed;
+  assert.equal(result.samples.length, frameCount);
+  assert.equal(store.size, frameCount * 25_000, '약 2.5GB가 저장소로 전달됨');
+  assert.equal(encoder.retainedBytes, 0);
+  const growthMB = (after - before) / 1048576;
+  assert.ok(growthMB < 80, `메타데이터만 보유해야 함: 힙 증가 ${growthMB.toFixed(0)} MB`);
 });

@@ -474,6 +474,8 @@ function updateModeVisibility() {
 
   if (videoFormatGroup) videoFormatGroup.classList.toggle('hidden', !showVideo);
   if (audioFormatGroup) audioFormatGroup.classList.toggle('hidden', !showAudioFile);
+  const videoHint = document.getElementById('videoHint');
+  if (videoHint) videoHint.classList.toggle('hidden', !showVideo);
 }
 
 // 녹화 모드 변경 핸들러

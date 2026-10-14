@@ -22,6 +22,20 @@ const OUT_DIR = process.env.RECORDA_E2E_OUT || join(__dirname, 'output');
 const LIB_DIR = process.env.CHROME_LIB_DIR || '';
 const FFPROBE = process.env.RECORDA_FFPROBE || 'ffprobe';
 const FFMPEG = process.env.RECORDA_FFMPEG || 'ffmpeg';
+//  CHROME_USER_DATA_DIR : Chrome 프로필 위치 (OPFS 녹화 임시 파일이 여기에 쌓이므로 용량이 넉넉한 디스크로)
+//  RECORDA_MEM_LIMIT_MB : 컨테이너(cgroup) 메모리 사용량이 이 값을 넘으면 녹화를 중단해 재기동을 피함 (기본 3072)
+const USER_DATA_DIR = process.env.CHROME_USER_DATA_DIR || '';
+const MEM_LIMIT_MB = Number(process.env.RECORDA_MEM_LIMIT_MB || 3072);
+
+// cgroup v2 메모리 사용량 (anon = 실제 프로세스 메모리, file = 페이지 캐시)
+function cgroupMemory() {
+  try {
+    const current = Number(readFileSync('/sys/fs/cgroup/memory.current', 'utf8')) / 1048576;
+    const stat = readFileSync('/sys/fs/cgroup/memory.stat', 'utf8');
+    const pick = (k) => Number((stat.match(new RegExp(`^${k} (\\d+)`, 'm')) || [0, 0])[1]) / 1048576;
+    return { currentMB: Math.round(current), anonMB: Math.round(pick('anon')), fileMB: Math.round(pick('file')) };
+  } catch { return null; }
+}
 
 const args = Object.fromEntries(process.argv.slice(2).map(a => { const [k, v] = a.replace(/^--/, '').split('='); return [k, v ?? true]; }));
 const DURATION = Number(args.duration || 10);
@@ -202,7 +216,12 @@ function summarize(samples, baseline) {
   const peak = samples[peakIdx];
   const types = Object.keys(peak.byType).sort((a, b) => peak.byType[b].rss - peak.byType[a].rss);
   const heaps = samples.map(s => s.jsHeapMB).filter(v => typeof v === 'number');
+  const step = Math.max(1, Math.floor(samples.length / 200)); // 최대 200점
+  const series = samples.filter((_, i) => i % step === 0 || i === samples.length - 1).map(s => ({
+    t: Math.round((s.t - samples[0].t) / 1000), pssMB: Math.round(s.totalRss / 1048576), rendererMB: Math.round(s.maxRendererRss / 1048576), cpuPct: Math.round(s.cpuPct), jsHeapMB: s.jsHeapMB === null ? null : Math.round(s.jsHeapMB)
+  }));
   return {
+    series,
     samples: samples.length,
     memoryMetric: 'PSS',
     baselinePssMB: +(baseline.totalRss / 1048576).toFixed(1),
@@ -279,6 +298,7 @@ async function main() {
     headless: true,
     env,
     protocolTimeout: 300_000,
+    userDataDir: USER_DATA_DIR || undefined,
     args: [
       '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
       `--disable-extensions-except=${EXT_DIR}`, `--load-extension=${EXT_DIR}`,
@@ -381,7 +401,7 @@ async function main() {
 
   for (const sc of SCENARIOS) {
     const duration = sc.duration || DURATION;
-    const width = sc.width || 1280, height = sc.height || 720;
+    const width = Number(args.width) || sc.width || 1280, height = Number(args.height) || sc.height || 720;
     log(`===== ${sc.id} (${sc.mode}, audio=${sc.audio}, video=${sc.video}, ${width}x${height}, ${duration}s) =====`);
     const result = { id: sc.id, mode: sc.mode, audioFormat: sc.audio, videoFormat: sc.video, width, height, durationSec: duration, ok: false, checks: [], files: [] };
     const before = new Set(readdirSync(OUT_DIR));
@@ -436,7 +456,19 @@ async function main() {
       const constraints = await offPage.evaluate(() => window.__e2e.constraints);
       result.checks.push({ name: 'getUserMedia: video 제약 요청 여부가 모드와 일치', pass: !!constraints.video === (sc.mode !== 'AUDIO_ONLY'), detail: JSON.stringify(constraints.video || false) });
 
-      await sleep(duration * 1000);
+      let aborted = null;
+      for (let waited = 0; waited < duration && !aborted; waited += 10) {
+        await sleep(Math.min(10, duration - waited) * 1000);
+        const cg = cgroupMemory();
+        if (cg && cg.currentMB > MEM_LIMIT_MB) {
+          aborted = `컨테이너 메모리 ${cg.currentMB} MB > 한계 ${MEM_LIMIT_MB} MB (anon ${cg.anonMB}, file ${cg.fileMB}) → 녹화 조기 중단`;
+          log('  ⚠ ' + aborted);
+        }
+        const last = sampler2.samples[sampler2.samples.length - 1];
+        if (duration >= 300 && last && (waited + 10) % 60 === 0) log(`  진행 ${Math.min(waited + 10, duration)}s: PSS ${Math.round(last.totalRss / 1048576)} MB, 렌더러 ${Math.round(last.maxRendererRss / 1048576)} MB, JS힙 ${last.jsHeapMB === null ? '?' : Math.round(last.jsHeapMB)} MB, CPU ${Math.round(last.cpuPct)}%${cg ? `, 컨테이너 ${cg.currentMB} MB (anon ${cg.anonMB})` : ''}`);
+      }
+      result.abortedEarly = aborted;
+      if (aborted) result.checks.push({ name: aborted, pass: false });
       const elapsedText = await popPage.$eval('#timeDisplay', el => el.textContent);
       result.checks.push({ name: `popup: 경과 시간 표시 ${elapsedText}`, pass: elapsedText !== '00:00' });
 
@@ -458,7 +490,7 @@ async function main() {
         const m = document.querySelector('#message');
         if (m.classList.contains('show') && m.classList.contains('info') && /저장 중/.test(m.textContent)) window.__sawSaving = true;
         return m.classList.contains('show') && (m.classList.contains('success') || m.classList.contains('error'));
-      }, { timeout: 180_000 });
+      }, { timeout: Math.max(180_000, duration * 1000) });
       const sawSaving = await popPage.evaluate(() => !!window.__sawSaving);
       result.sawSavingMessage = sawSaving;
       const stopLatencyMs = Date.now() - tStop;
@@ -469,7 +501,7 @@ async function main() {
       result.checks.push({ name: `popup: 완료 메시지 "${message.text}" (${stopLatencyMs}ms, 저장 중 표시: ${sawSaving ? '있음' : '없음'})`, pass: message.cls.includes('success') });
 
       // chrome.downloads 완료 대기 후 요청 파일명으로 복원
-      const deadline = Date.now() + 120_000;
+      const deadline = Date.now() + Math.max(120_000, duration * 500);
       let files = [];
       let downloadItems = [];
       while (Date.now() < deadline) {

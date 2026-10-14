@@ -308,3 +308,52 @@ test('녹화 중 주기적으로 RECORDING_HEARTBEAT(tabId, startTime, plan)를 
   await flush(150);
   assert.equal(fake.calls.sendMessage.filter(m => m.action === MESSAGE_TYPES.RECORDING_HEARTBEAT).length, count, '중지 후에는 하트비트 중단');
 });
+
+// ---- OPFS 디스크 저장소 사용 ----
+import { installFakeOpfs } from './helpers/fake-opfs.js';
+import { OPFS_ROOT_DIR } from '../storage/chunk-store.js';
+
+test('OPFS가 있으면 녹화 데이터를 디스크(세션 디렉토리)에 기록하고 결과 파일도 OPFS에 만들며, 다음 녹화 시작 시 이전 세션을 정리한다', async () => {
+  const root = installFakeOpfs();
+  installVideoFakes(6);
+  workletPorts = [];
+  const plan = resolveRecordingPlan({ mode: RECORDING_MODES.VIDEO_AUDIO_SPLIT, audioFormat: 'wav', videoFormat: 'mp4' });
+  const res = await fake.dispatch({ action: MESSAGE_TYPES.START_CAPTURE, data: { streamId: 'opfs1', format: 'wav', bitrate: 128, sampleRate: 44100, plan } });
+  assert.equal(res.success, true, res.error);
+  feedAudio(4);
+  fake.calls.sendMessage.length = 0;
+  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
+  await flush(300);
+
+  const complete = fake.calls.sendMessage.find(m => m.action === MESSAGE_TYPES.RECORDING_COMPLETE);
+  assert.ok(complete, 'RECORDING_COMPLETE');
+  assert.equal(complete.data.files.length, 2);
+  assert.ok(complete.data.files.every(f => f.size > 0));
+  assert.equal(complete.data.storage, 'opfs', '디스크 저장소 사용을 보고');
+
+  const base = await root.getDirectoryHandle(OPFS_ROOT_DIR);
+  const sessions = [];
+  for await (const k of base.keys()) sessions.push(k);
+  assert.equal(sessions.length, 1, '세션 디렉토리 1개');
+  const dir = await base.getDirectoryHandle(sessions[0]);
+  const names = [];
+  for await (const k of dir.keys()) names.push(k);
+  assert.ok(names.some(n => n.endsWith('.mp4')) && names.some(n => n.endsWith('.wav')), `OPFS 파일: ${names}`);
+
+  // 다음 녹화 시작 → 이전 세션 정리
+  installVideoFakes(2);
+  workletPorts = [];
+  await flush(5); // 세션 ID(타임스탬프) 충돌 방지
+  const plan2 = resolveRecordingPlan({ mode: RECORDING_MODES.AUDIO_ONLY, audioFormat: 'mp3' });
+  const res2 = await fake.dispatch({ action: MESSAGE_TYPES.START_CAPTURE, data: { streamId: 'opfs2', format: 'mp3', bitrate: 128, sampleRate: 44100, plan: plan2 } });
+  assert.equal(res2.success, true, res2.error);
+  await flush(50);
+  const after = [];
+  for await (const k of base.keys()) after.push(k);
+  assert.equal(after.length, 1, '이전 세션 삭제, 현재 세션만');
+  assert.notEqual(after[0], sessions[0]);
+  feedAudio(2);
+  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
+  await flush(300);
+  delete globalThis.navigator.storage;
+});

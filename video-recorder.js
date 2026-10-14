@@ -1,9 +1,11 @@
 // Video Recorder - 탭 영상 트랙을 WebCodecs(VideoEncoder)로 H.264 인코딩하고
 // 컨테이너 오디오(MP3)와 함께 MP4/MOV/AVI로 머싱합니다.
 import { VIDEO_SETTINGS, VIDEO_FORMATS, ERROR_MESSAGES } from './constants.js';
-import { buildMp4 } from './muxers/mp4-muxer.js';
-import { buildAvi, AVI_MAX_BYTES } from './muxers/avi-muxer.js';
+import { writeMp4 } from './muxers/mp4-muxer.js';
+import { writeAvi, countNalUnits, AVI_MAX_BYTES } from './muxers/avi-muxer.js';
+import { parseAvcC } from './muxers/h264.js';
 import { ContainerAudioEncoder } from './container-audio-encoder.js';
+import { MemoryFileSink } from './storage/chunk-store.js';
 
 const MIME_TYPES = {
   [VIDEO_FORMATS.MP4]: 'video/mp4',
@@ -34,12 +36,16 @@ function defaultDeps() {
  */
 export class VideoTrackEncoder {
   /**
-   * @param {{track: MediaStreamTrack, deps?: Object, settings?: Object}} options
+   * @param {{track: MediaStreamTrack, chunkStore?: Object, deps?: Object, settings?: Object}} options
+   *   chunkStore: 인코딩된 청크를 넘길 저장소(ChunkStore). 주어지면 메모리에는 참조(offset/size)와 메타데이터만 남깁니다.
    */
-  constructor({ track, deps = {}, settings = VIDEO_SETTINGS }) {
+  constructor({ track, chunkStore = null, deps = {}, settings = VIDEO_SETTINGS }) {
     this.track = track;
+    this.chunkStore = chunkStore;
     this.deps = { ...defaultDeps(), ...deps };
     this.settings = settings;
+    this.nalLengthSize = 4;
+    this.retainedBytes = 0; // 메모리에 보유 중인 청크 바이트 (저장소 사용 시 0)
 
     this.encoder = null;
     this.reader = null;
@@ -243,10 +249,19 @@ export class VideoTrackEncoder {
     if (metadata && metadata.decoderConfig && metadata.decoderConfig.description && !this.avcC) {
       const desc = metadata.decoderConfig.description;
       this.avcC = desc instanceof Uint8Array ? desc.slice() : new Uint8Array(desc.buffer ? desc.buffer.slice(desc.byteOffset, desc.byteOffset + desc.byteLength) : desc);
+      try { this.nalLengthSize = parseAvcC(this.avcC).nalLengthSize; } catch { this.nalLengthSize = 4; }
     }
     const data = new Uint8Array(chunk.byteLength);
     chunk.copyTo(data);
-    this.rawSamples.push({ data, timestamp: chunk.timestamp, keyframe: chunk.type === 'key' });
+    const keyframe = chunk.type === 'key';
+    if (this.chunkStore) {
+      // 데이터는 디스크 저장소로, 메모리에는 참조와 Annex B 변환 크기 계산용 NAL 개수만
+      const ref = this.chunkStore.append(data);
+      this.rawSamples.push({ ref, nalCount: countNalUnits(data, this.nalLengthSize), timestamp: chunk.timestamp, keyframe });
+    } else {
+      this.retainedBytes += data.length;
+      this.rawSamples.push({ data, timestamp: chunk.timestamp, keyframe });
+    }
   }
 
   /**
@@ -279,8 +294,12 @@ export class VideoTrackEncoder {
       throw new Error(`${ERROR_MESSAGES.VIDEO_ENCODING_FAILED} (${this.encoderError.message || this.encoderError})`);
     }
 
-    console.log('[VideoTrackEncoder] 완료:', { frames: this.frameCount, dropped: this.droppedFrames, normalized: this.normalizedFrames, scaled: this.scaledFrames, samples: this.rawSamples.length });
-    return { width: this.width, height: this.height, avcC: this.avcC, samples: this.getSamples() };
+    if (this.chunkStore) {
+      await this.chunkStore.finalize();
+    }
+
+    console.log('[VideoTrackEncoder] 완료:', { frames: this.frameCount, dropped: this.droppedFrames, normalized: this.normalizedFrames, scaled: this.scaledFrames, samples: this.rawSamples.length, storage: this.chunkStore ? this.chunkStore.kind : 'memory' });
+    return { width: this.width, height: this.height, avcC: this.avcC, samples: this.getSamples(), store: this.chunkStore };
   }
 
   /** 정렬 오프셋을 적용한 샘플 목록 (첫 샘플은 원점 유지, 이후 샘플은 오프셋만큼 뒤로) */
@@ -289,6 +308,8 @@ export class VideoTrackEncoder {
     const origin = this.rawSamples[0].timestamp;
     return this.rawSamples.map((s, i) => ({
       data: s.data,
+      ref: s.ref,
+      nalCount: s.nalCount,
       keyframe: s.keyframe,
       timestamp: i === 0 ? 0 : (s.timestamp - origin) + this.alignmentOffsetUs
     }));
@@ -300,9 +321,10 @@ export class VideoTrackEncoder {
  */
 export class VideoRecordingSession {
   /**
-   * @param {{format:string, videoTrack:MediaStreamTrack, sampleRate:number, bitrateKbps:number, channels?:number, deps?:Object, settings?:Object}} options
+   * @param {{format:string, videoTrack:MediaStreamTrack, sampleRate:number, bitrateKbps:number, channels?:number, storage?:Object, deps?:Object, settings?:Object}} options
+   *   storage: createRecordingStorage()가 만든 저장소. 주어지면 인코딩 데이터와 결과 파일을 디스크(OPFS)에 둡니다.
    */
-  constructor({ format, videoTrack, sampleRate, bitrateKbps, channels = 2, deps = {}, settings = VIDEO_SETTINGS }) {
+  constructor({ format, videoTrack, sampleRate, bitrateKbps, channels = 2, storage = null, deps = {}, settings = VIDEO_SETTINGS }) {
     if (!MIME_TYPES[format]) {
       throw new Error(`지원하지 않는 영상 포맷입니다: ${format}`);
     }
@@ -310,18 +332,28 @@ export class VideoRecordingSession {
     this.actualFormat = format; // AVI 크기 한계 초과 시 mp4로 바뀔 수 있음
     this.warning = null;
     this.settings = settings;
-    this.videoEncoder = new VideoTrackEncoder({ track: videoTrack, deps, settings });
-    this.audioEncoder = new ContainerAudioEncoder({ sampleRate, channels, bitrateKbps });
+    this.storage = storage;
+    this.audioOptions = { sampleRate, channels, bitrateKbps };
+    this.videoTrack = videoTrack;
+    this.deps = deps;
+    this.videoEncoder = null;
+    this.audioEncoder = null;
     this.stats = { videoFrames: 0, droppedFrames: 0, audioFrames: 0, bytes: 0 };
   }
 
   async start() {
+    const videoStore = this.storage ? await this.storage.createChunkStore('video.bin') : null;
+    const audioStore = this.storage ? await this.storage.createChunkStore('container-audio.bin') : null;
+    this.videoEncoder = new VideoTrackEncoder({ track: this.videoTrack, chunkStore: videoStore, deps: this.deps, settings: this.settings });
+    this.audioEncoder = new ContainerAudioEncoder({ ...this.audioOptions, chunkStore: audioStore });
+    if (typeof this.audioStartTime === 'number') this.videoEncoder.setAudioStartTime(this.audioStartTime);
     this.audioEncoder.start();
     await this.videoEncoder.start();
   }
 
   setAudioStartTime(time) {
-    this.videoEncoder.setAudioStartTime(time);
+    this.audioStartTime = time;
+    if (this.videoEncoder) this.videoEncoder.setAudioStartTime(time);
   }
 
   pushAudio(left, right) {
@@ -332,16 +364,18 @@ export class VideoRecordingSession {
    * @returns {Promise<Blob>} 완성된 영상 파일
    */
   async stop() {
+    if (!this.videoEncoder) throw new Error('세션이 시작되지 않았습니다');
     const video = await this.videoEncoder.stop();
-    const audio = this.audioEncoder.isStarted ? this.audioEncoder.finish() : null;
+    const audio = this.audioEncoder.isStarted ? await this.audioEncoder.finish() : null;
 
     if (!video.samples.length || !video.avcC) {
       throw new Error(ERROR_MESSAGES.NO_VIDEO);
     }
 
+    const sizeOf = (x) => (x.data ? x.data.length : x.ref.size);
     let format = this.format;
     if (format === VIDEO_FORMATS.AVI) {
-      const estimated = video.samples.reduce((s, x) => s + x.data.length + 40, 0) + (audio ? audio.frames.reduce((s, f) => s + f.data.length + 24, 0) : 0);
+      const estimated = video.samples.reduce((s, x) => s + sizeOf(x) + 40, 0) + (audio ? audio.frames.reduce((s, f) => s + sizeOf(f) + 24, 0) : 0);
       if (estimated > AVI_MAX_BYTES) {
         console.warn('[VideoRecordingSession] AVI 2GB 한계 초과 → MP4로 저장');
         this.warning = ERROR_MESSAGES.AVI_TOO_LARGE;
@@ -350,16 +384,21 @@ export class VideoRecordingSession {
     }
     this.actualFormat = format;
 
-    const parts = format === VIDEO_FORMATS.AVI
-      ? buildAvi({ video, audio, frameRate: this.settings.FRAME_RATE })
-      : buildMp4({ container: format, video, audio });
+    // 결과 파일은 디스크(OPFS) 싱크에 한 샘플씩 스트리밍 → 메모리 사용량이 파일 크기와 무관
+    const output = this.storage
+      ? await this.storage.createFileSink(`video.${format}`, MIME_TYPES[format])
+      : new MemoryFileSink(MIME_TYPES[format]);
+    const result = format === VIDEO_FORMATS.AVI
+      ? await writeAvi({ video, audio, frameRate: this.settings.FRAME_RATE, output })
+      : await writeMp4({ container: format, video, audio, output });
 
-    const blob = new Blob(parts, { type: MIME_TYPES[format] });
+    const blob = result.blob;
     this.stats = {
       videoFrames: video.samples.length,
       droppedFrames: this.videoEncoder.droppedFrames,
       audioFrames: audio ? audio.frames.length : 0,
-      bytes: blob.size
+      bytes: blob.size,
+      storage: this.storage ? this.storage.kind : 'memory'
     };
     console.log('[VideoRecordingSession] 머싱 완료:', format, this.stats);
     return blob;
