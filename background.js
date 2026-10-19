@@ -1,5 +1,5 @@
-import { MESSAGE_TYPES, SETTINGS, ERROR_MESSAGES, RECORDING_STATES, RECORDING_MODES, SESSION_KEYS } from './constants.js';
-import { getElapsedSeconds } from './utils.js';
+import { MESSAGE_TYPES, SETTINGS, ERROR_MESSAGES, RECORDING_STATES, RECORDING_MODES, SESSION_KEYS, SAVE_LOCATIONS } from './constants.js';
+import { getActiveElapsedSeconds } from './utils.js';
 import { loadSettings, resetSettings } from './storage.js';
 import { resolveRecordingPlan } from './recording-plan.js';
 
@@ -7,11 +7,14 @@ import { resolveRecordingPlan } from './recording-plan.js';
 // 상태 관리
 // MV3 Service Worker는 유휴 30초 후 종료될 수 있으므로 메모리 상태를 chrome.storage.session에 함께 저장하고
 // 시작 시 복원합니다. Offscreen은 녹화 중 주기적으로 RECORDING_HEARTBEAT를 보내 SW를 깨우고 상태를 복구시킵니다.
+// 상태 전환: IDLE → RECORDING ⇄ PAUSED → PROCESSING → IDLE (START는 IDLE에서만, STOP은 RECORDING/PAUSED에서)
 // ---------------------------------------------------------------------------
 const IDLE_STATE = {
   state: RECORDING_STATES.IDLE,
   tabId: null,
   startTime: null,
+  pausedAt: null,     // 진행 중인 일시정지의 시작 시각 (PAUSED일 때만)
+  pausedTotalMs: 0,   // 끝난 일시정지들의 누적 시간 (경과 시간에서 제외)
   format: SETTINGS.DEFAULT_FORMAT,
   mode: RECORDING_MODES.AUDIO_ONLY,
   plan: null,
@@ -22,6 +25,11 @@ let recordingState = { ...IDLE_STATE };
 
 const ALARM_UPDATE_TIME = 'updateTime';
 const ALARM_DOWNLOAD_TIMEOUT = 'downloadTimeout';
+
+// 녹화 세션이 진행 중인지 (일시정지 포함)
+function isSessionActive(state = recordingState.state) {
+  return state === RECORDING_STATES.RECORDING || state === RECORDING_STATES.PAUSED;
+}
 
 // SW 시작 시 세션 스토리지에서 상태 복원 (모든 핸들러는 이 Promise를 기다림)
 const ready = rehydrateState();
@@ -37,14 +45,14 @@ async function rehydrateState() {
     if (offscreenAlive) {
       recordingState = { ...IDLE_STATE, ...stored, files: [] };
       console.log('[Background] 세션 상태 복원:', recordingState.state, recordingState.mode);
-      updateBadge(recordingState.state === RECORDING_STATES.RECORDING);
+      updateBadge(recordingState.state);
       if (recordingState.state === RECORDING_STATES.RECORDING) {
         chrome.alarms.create(ALARM_UPDATE_TIME, { periodInMinutes: 1 / 60 });
       }
     } else {
       console.warn('[Background] 세션에 녹화 상태가 있지만 Offscreen 문서가 없어 IDLE로 정리합니다');
       await setRecordingState({ ...IDLE_STATE });
-      updateBadge(false);
+      updateBadge(RECORDING_STATES.IDLE);
     }
   } catch (error) {
     console.error('[Background] 상태 복원 실패:', error);
@@ -57,6 +65,8 @@ async function setRecordingState(next) {
     state: next.state,
     tabId: next.tabId,
     startTime: next.startTime,
+    pausedAt: next.pausedAt ?? null,
+    pausedTotalMs: next.pausedTotalMs || 0,
     format: next.format,
     mode: next.mode,
     plan: next.plan
@@ -101,6 +111,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return handleStartRecording(message.data, sendResponse);
       case MESSAGE_TYPES.STOP_RECORDING:
         return handleStopRecording(sendResponse);
+      case MESSAGE_TYPES.PAUSE_RECORDING:
+        return handlePauseRecording(sendResponse);
+      case MESSAGE_TYPES.RESUME_RECORDING:
+        return handleResumeRecording(sendResponse);
       case MESSAGE_TYPES.GET_STATE:
         return handleGetState(sendResponse);
       case MESSAGE_TYPES.RECORDING_STARTED:
@@ -138,7 +152,9 @@ async function handleStartRecording(data, sendResponse) {
 
   let started = false;
   try {
-    const { tabId, format, mode, videoFormat } = data || {};
+    const { tabId, format, mode, videoFormat, saveLocation } = data || {};
+    // 저장 위치: 팝업이 녹화 시작 클릭(사용자 제스처) 때 폴더 권한을 확인한 경우에만 'folder'. 그 외는 기존 다운로드 경로
+    const saveToFolder = saveLocation === SAVE_LOCATIONS.FOLDER;
 
     if (tabId === null || tabId === undefined || typeof tabId !== 'number' || tabId < 0 || !Number.isInteger(tabId)) {
       throw new Error('유효하지 않은 탭 ID입니다.');
@@ -153,7 +169,7 @@ async function handleStartRecording(data, sendResponse) {
       audioFormat: format || settings.fileFormat || SETTINGS.DEFAULT_FORMAT,
       videoFormat: videoFormat || settings.videoFormat
     });
-    console.log('[Background] 녹화 계획:', plan);
+    console.log('[Background] 녹화 계획:', plan, '| 저장 위치:', saveToFolder ? '사용자 폴더' : '다운로드 폴더');
 
     // Offscreen Document를 먼저 준비 (스트림 ID는 발급 후 짧은 시간 안에 사용해야 함)
     await createOffscreenDocument();
@@ -182,7 +198,7 @@ async function handleStartRecording(data, sendResponse) {
       plan
     });
     started = true;
-    updateBadge(true);
+    updateBadge(RECORDING_STATES.RECORDING);
 
     // Offscreen에 캡처 시작 요청 (응답을 확인해 실패 시 즉시 롤백)
     const response = await chrome.runtime.sendMessage({
@@ -195,7 +211,8 @@ async function handleStartRecording(data, sendResponse) {
         plan,
         tabId,
         startTime,
-        heartbeatIntervalMs: SETTINGS.HEARTBEAT_INTERVAL
+        heartbeatIntervalMs: SETTINGS.HEARTBEAT_INTERVAL,
+        saveToFolder
       }
     });
     if (!response || response.success === false) {
@@ -203,12 +220,13 @@ async function handleStartRecording(data, sendResponse) {
     }
 
     chrome.alarms.create(ALARM_UPDATE_TIME, { periodInMinutes: 1 / 60 });
-    sendResponse({ success: true });
+    // 상태 페이로드 포함: Popup이 자체 타이머를 Background의 startTime 기준으로 시작하도록 (일시정지 시 표시 시간 튐 방지)
+    sendResponse({ success: true, data: buildStatePayload() });
   } catch (error) {
     console.error('녹음 시작 실패:', error);
     if (started) {
       await setRecordingState({ ...IDLE_STATE });
-      updateBadge(false);
+      updateBadge(RECORDING_STATES.IDLE);
       chrome.alarms.clear(ALARM_UPDATE_TIME);
     }
     sendResponse({ success: false, error: error.message });
@@ -232,7 +250,8 @@ async function handleStopRecording(sendResponse) {
   try {
     console.log('녹음 중지 요청');
 
-    if (recordingState.state !== RECORDING_STATES.RECORDING) {
+    // 일시정지 중에도 중지 가능 (PAUSED → PROCESSING)
+    if (!isSessionActive()) {
       throw new Error(ERROR_MESSAGES.NOT_RECORDING);
     }
 
@@ -244,12 +263,96 @@ async function handleStopRecording(sendResponse) {
   }
 }
 
-// RECORDING → PROCESSING 전환 및 Offscreen에 중지 요청
+// RECORDING/PAUSED → PROCESSING 전환 및 Offscreen에 중지 요청
 async function beginProcessing() {
-  await setRecordingState({ ...recordingState, state: RECORDING_STATES.PROCESSING });
+  const next = { ...recordingState, state: RECORDING_STATES.PROCESSING };
+  if (recordingState.state === RECORDING_STATES.PAUSED && typeof recordingState.pausedAt === 'number') {
+    // 진행 중이던 일시정지를 누적 시간으로 정리 (처리 중 표시 시간도 일시정지 제외)
+    next.pausedTotalMs = (recordingState.pausedTotalMs || 0) + Math.max(0, Date.now() - recordingState.pausedAt);
+    next.pausedAt = null;
+  }
+  await setRecordingState(next);
   chrome.alarms.clear(ALARM_UPDATE_TIME);
   notifyStateChange();
   await chrome.runtime.sendMessage({ action: MESSAGE_TYPES.STOP_CAPTURE });
+}
+
+// 일시정지 (RECORDING → PAUSED): 캡처 스트림과 하트비트는 유지하고 Offscreen은 인코더 입력만 멈춤
+async function handlePauseRecording(sendResponse) {
+  // 상태 검사는 try 바깥에서: 거부된 요청이 진행 중인 녹화를 되돌리지 않도록
+  if (recordingState.state !== RECORDING_STATES.RECORDING) {
+    sendResponse({ success: false, error: ERROR_MESSAGES.NOT_RECORDING });
+    return;
+  }
+
+  const pausedAt = Date.now();
+  try {
+    console.log('[Background] 일시정지 요청');
+    await setRecordingState({ ...recordingState, state: RECORDING_STATES.PAUSED, pausedAt });
+    chrome.alarms.clear(ALARM_UPDATE_TIME);
+    updateBadge(RECORDING_STATES.PAUSED);
+
+    const response = await chrome.runtime.sendMessage({
+      action: MESSAGE_TYPES.PAUSE_CAPTURE,
+      data: { pausedAt, pausedTotalMs: recordingState.pausedTotalMs || 0 }
+    });
+    if (!response || response.success === false) {
+      throw new Error((response && response.error) || ERROR_MESSAGES.UNKNOWN);
+    }
+
+    notifyStateChange();
+    sendResponse({ success: true, data: buildStatePayload() });
+  } catch (error) {
+    console.error('[Background] 일시정지 실패:', error);
+    // 그 사이 다른 전환(중지 등)이 없었을 때만 RECORDING으로 되돌림
+    if (recordingState.state === RECORDING_STATES.PAUSED && recordingState.pausedAt === pausedAt) {
+      await setRecordingState({ ...recordingState, state: RECORDING_STATES.RECORDING, pausedAt: null });
+      updateBadge(RECORDING_STATES.RECORDING);
+      chrome.alarms.create(ALARM_UPDATE_TIME, { periodInMinutes: 1 / 60 });
+      notifyStateChange();
+    }
+    sendResponse({ success: false, error: error.message });
+  }
+}
+
+// 재개 (PAUSED → RECORDING): 이번 일시정지 시간을 pausedTotalMs에 누적
+async function handleResumeRecording(sendResponse) {
+  if (recordingState.state !== RECORDING_STATES.PAUSED) {
+    sendResponse({ success: false, error: ERROR_MESSAGES.NOT_PAUSED });
+    return;
+  }
+
+  const pausedState = recordingState; // 실패 시 복구용
+  const now = Date.now();
+  const pausedAt = typeof pausedState.pausedAt === 'number' ? pausedState.pausedAt : now;
+  const pausedTotalMs = (pausedState.pausedTotalMs || 0) + Math.max(0, now - pausedAt);
+  try {
+    console.log('[Background] 재개 요청 (이번 일시정지', now - pausedAt, 'ms, 누적', pausedTotalMs, 'ms)');
+    await setRecordingState({ ...recordingState, state: RECORDING_STATES.RECORDING, pausedAt: null, pausedTotalMs });
+    updateBadge(RECORDING_STATES.RECORDING);
+    chrome.alarms.create(ALARM_UPDATE_TIME, { periodInMinutes: 1 / 60 });
+
+    const response = await chrome.runtime.sendMessage({
+      action: MESSAGE_TYPES.RESUME_CAPTURE,
+      data: { pausedTotalMs }
+    });
+    if (!response || response.success === false) {
+      throw new Error((response && response.error) || ERROR_MESSAGES.UNKNOWN);
+    }
+
+    notifyStateChange();
+    sendResponse({ success: true, data: buildStatePayload() });
+  } catch (error) {
+    console.error('[Background] 재개 실패:', error);
+    // 그 사이 다른 전환이 없었을 때만 원래 일시정지 상태로 되돌림
+    if (recordingState.state === RECORDING_STATES.RECORDING && recordingState.pausedAt === null && recordingState.pausedTotalMs === pausedTotalMs) {
+      await setRecordingState({ ...recordingState, state: RECORDING_STATES.PAUSED, pausedAt: pausedState.pausedAt, pausedTotalMs: pausedState.pausedTotalMs || 0 });
+      chrome.alarms.clear(ALARM_UPDATE_TIME);
+      updateBadge(RECORDING_STATES.PAUSED);
+      notifyStateChange();
+    }
+    sendResponse({ success: false, error: error.message });
+  }
 }
 
 // 현재 상태 조회
@@ -258,12 +361,18 @@ function handleGetState(sendResponse) {
 }
 
 function buildStatePayload() {
-  const elapsed = recordingState.startTime ? getElapsedSeconds(recordingState.startTime) : 0;
+  const { startTime } = recordingState;
+  const pausedTotalMs = recordingState.pausedTotalMs || 0;
   return {
     state: recordingState.state,
     isRecording: recordingState.state === RECORDING_STATES.RECORDING,
-    startTime: recordingState.startTime,
-    elapsed,
+    paused: recordingState.state === RECORDING_STATES.PAUSED,
+    startTime,
+    // Popup 자체 타이머의 기준 시각: 일시정지 누적 시간만큼 뒤로 민 시작 시각 (일시정지 중에는 타이머를 멈추고 elapsed 표시)
+    effectiveStartTime: typeof startTime === 'number' ? startTime + pausedTotalMs : null,
+    pausedAt: recordingState.pausedAt ?? null,
+    pausedTotalMs,
+    elapsed: getActiveElapsedSeconds(recordingState), // 일시정지 시간 제외
     format: recordingState.format,
     mode: recordingState.mode,
     plan: recordingState.plan,
@@ -272,22 +381,27 @@ function buildStatePayload() {
   };
 }
 
-// Offscreen 하트비트: SW가 재시작되어 상태를 잃었으면 복구
+// Offscreen 하트비트: SW가 재시작되어 상태를 잃었으면 복구 (일시정지 상태 포함)
 async function handleHeartbeat(data, sendResponse) {
   if (recordingState.state === RECORDING_STATES.IDLE && data && data.plan && typeof data.startTime === 'number') {
     console.warn('[Background] 하트비트로 녹화 상태 복구:', data);
     const audioOutput = (data.plan.outputs || []).find(o => o.kind === 'audio');
+    const paused = data.paused === true;
     await setRecordingState({
       ...IDLE_STATE,
-      state: RECORDING_STATES.RECORDING,
+      state: paused ? RECORDING_STATES.PAUSED : RECORDING_STATES.RECORDING,
       tabId: typeof data.tabId === 'number' ? data.tabId : null,
       startTime: data.startTime,
+      pausedAt: paused ? (typeof data.pausedAt === 'number' ? data.pausedAt : Date.now()) : null,
+      pausedTotalMs: typeof data.pausedTotalMs === 'number' && data.pausedTotalMs > 0 ? data.pausedTotalMs : 0,
       format: data.format || (audioOutput ? audioOutput.format : SETTINGS.DEFAULT_FORMAT),
       mode: data.plan.mode,
       plan: data.plan
     });
-    updateBadge(true);
-    chrome.alarms.create(ALARM_UPDATE_TIME, { periodInMinutes: 1 / 60 });
+    updateBadge(recordingState.state);
+    if (!paused) {
+      chrome.alarms.create(ALARM_UPDATE_TIME, { periodInMinutes: 1 / 60 });
+    }
     notifyStateChange();
   }
   sendResponse({ success: true, state: recordingState.state });
@@ -447,7 +561,7 @@ async function handleRecordingComplete(data, sendResponse) {
       await setRecordingState({ ...IDLE_STATE });
       recordingState.files = merged;
       recordingState.saving = pendingCount > 0;
-      updateBadge(false);
+      updateBadge(RECORDING_STATES.IDLE);
       chrome.alarms.clear(ALARM_UPDATE_TIME);
 
       notifyStateChange();
@@ -478,7 +592,7 @@ async function handleRecordingError(data, sendResponse) {
     await setRecordingState({ ...IDLE_STATE });
     await sessionSet(SESSION_KEYS.PENDING_DOWNLOADS, {});
 
-    try { updateBadge(false); } catch (error) { console.error('[Background] Badge 초기화 실패:', error); }
+    try { updateBadge(RECORDING_STATES.IDLE); } catch (error) { console.error('[Background] Badge 초기화 실패:', error); }
     try { chrome.alarms.clear(ALARM_UPDATE_TIME); chrome.alarms.clear(ALARM_DOWNLOAD_TIMEOUT); } catch (error) { console.error('[Background] 알람 중지 실패:', error); }
 
     // Popup UI 재동기화 후 에러 표시
@@ -547,10 +661,14 @@ async function closeOffscreenDocument() {
 // ---------------------------------------------------------------------------
 // Badge / 설정 / 알림
 // ---------------------------------------------------------------------------
-function updateBadge(isRecording) {
-  if (isRecording) {
+// 배지: 녹화 중 'REC', 일시정지 'II', 그 외 비움
+function updateBadge(state) {
+  if (state === RECORDING_STATES.RECORDING) {
     chrome.action.setBadgeText({ text: SETTINGS.BADGE_TEXT_RECORDING });
     chrome.action.setBadgeBackgroundColor({ color: SETTINGS.BADGE_COLOR_RECORDING });
+  } else if (state === RECORDING_STATES.PAUSED) {
+    chrome.action.setBadgeText({ text: SETTINGS.BADGE_TEXT_PAUSED });
+    chrome.action.setBadgeBackgroundColor({ color: SETTINGS.BADGE_COLOR_PAUSED });
   } else {
     chrome.action.setBadgeText({ text: SETTINGS.BADGE_TEXT_IDLE });
   }
@@ -580,9 +698,14 @@ function notifyStateChange() {
 chrome.alarms.onAlarm.addListener((alarm) => {
   ready.then(async () => {
     if (alarm.name === ALARM_UPDATE_TIME && recordingState.state === RECORDING_STATES.RECORDING) {
+      const { startTime } = recordingState;
       chrome.runtime.sendMessage({
         action: MESSAGE_TYPES.UPDATE_TIME,
-        data: { elapsed: getElapsedSeconds(recordingState.startTime), startTime: recordingState.startTime }
+        data: {
+          elapsed: getActiveElapsedSeconds(recordingState),
+          startTime,
+          effectiveStartTime: typeof startTime === 'number' ? startTime + (recordingState.pausedTotalMs || 0) : null
+        }
       }).catch(() => {});
     } else if (alarm.name === ALARM_DOWNLOAD_TIMEOUT) {
       console.warn('[Background] 다운로드 완료 대기 타임아웃 - Offscreen을 종료합니다');
@@ -598,11 +721,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }).catch((error) => console.error('[Background] 알람 처리 실패:', error));
 });
 
-// 녹화 중인 탭이 닫히면 녹화를 마무리
+// 녹화 중인 탭이 닫히면 녹화를 마무리 (일시정지 중이어도)
 if (chrome.tabs && chrome.tabs.onRemoved) {
   chrome.tabs.onRemoved.addListener((tabId) => {
     ready.then(async () => {
-      if (recordingState.state === RECORDING_STATES.RECORDING && recordingState.tabId === tabId) {
+      if (isSessionActive() && recordingState.tabId === tabId) {
         console.warn('[Background] 녹화 중인 탭이 닫혔습니다. 녹화를 마무리합니다:', tabId);
         await beginProcessing();
       }

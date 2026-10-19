@@ -3,11 +3,15 @@ export const MESSAGE_TYPES = {
   // Popup → Background
   START_RECORDING: 'START_RECORDING',
   STOP_RECORDING: 'STOP_RECORDING',
+  PAUSE_RECORDING: 'PAUSE_RECORDING',   // 일시정지 (RECORDING → PAUSED)
+  RESUME_RECORDING: 'RESUME_RECORDING', // 재개 (PAUSED → RECORDING)
   GET_STATE: 'GET_STATE',
 
   // Background → Offscreen
   START_CAPTURE: 'START_CAPTURE',
   STOP_CAPTURE: 'STOP_CAPTURE',
+  PAUSE_CAPTURE: 'PAUSE_CAPTURE',   // 캡처는 유지한 채 인코더 입력만 중단
+  RESUME_CAPTURE: 'RESUME_CAPTURE', // 인코더 입력 재개
 
   // Offscreen → Background
   DOWNLOAD_FILE: 'DOWNLOAD_FILE',
@@ -30,6 +34,8 @@ export const SETTINGS = {
   DEFAULT_BITRATE: 128000,
   BADGE_TEXT_RECORDING: 'REC',
   BADGE_COLOR_RECORDING: '#FF0000',
+  BADGE_TEXT_PAUSED: 'II',
+  BADGE_COLOR_PAUSED: '#F57C00',
   BADGE_TEXT_IDLE: '',
   UPDATE_INTERVAL: 1000, // ms
   DOWNLOAD_WAIT_TIMEOUT_MINUTES: 10, // 다운로드 완료 대기 최대 시간 (chrome.alarms, 분)
@@ -42,13 +48,22 @@ export const SESSION_KEYS = {
   PENDING_DOWNLOADS: 'pendingDownloads'
 };
 
+// Save Locations - 녹화 파일 저장 위치
+export const SAVE_LOCATIONS = {
+  DOWNLOADS: 'downloads', // 기본: chrome.downloads로 다운로드 폴더에 저장 (OPFS → 다운로드 복사)
+  FOLDER: 'folder'        // 설정 페이지에서 고른 폴더에 직접 기록 (File System Access API, 복사 단계 없음)
+};
+
 // Default Settings - 사용자 설정 기본값
 export const DEFAULT_SETTINGS = {
   fileFormat: 'mp3',           // 오디오 저장 포맷 (mp3, wav)
   bitrate: 128,                // 오디오 비트레이트 (kbps)
   sampleRate: 44100,           // 샘플레이트 (Hz)
   recordingMode: 'AUDIO_ONLY', // 녹화 모드 (RECORDING_MODES 참조)
-  videoFormat: 'mp4'           // 영상 저장 포맷 (mp4, mov, avi)
+  videoFormat: 'mp4',          // 영상 저장 포맷 (mp4, mov, avi, fmp4)
+  // 저장 위치 미러: 팝업이 녹화 시작 때 폴더 권한 확인 여부를 정하는 데 사용 (폴더 핸들 자체는 IndexedDB에 보관 - save-location.js)
+  saveLocationMode: 'downloads', // SAVE_LOCATIONS 값
+  saveLocationName: ''           // 선택한 폴더 이름 (참고용, 표시는 설정 페이지에서만)
 };
 
 // Storage Keys - 스토리지 키 상수
@@ -67,11 +82,14 @@ export const ERROR_MESSAGES = {
   AVI_TOO_LARGE: 'AVI 파일은 2GB를 넘을 수 없어 MP4로 저장했습니다.',
   ALREADY_RECORDING: '이미 녹음이 진행 중입니다.',
   NOT_RECORDING: '녹음이 진행 중이 아닙니다.',
+  NOT_PAUSED: '일시정지 상태가 아닙니다.',
   OFFSCREEN_CREATE_FAILED: 'Offscreen Document 생성에 실패했습니다.',
   ENCODING_FAILED: '오디오 인코딩에 실패했습니다.',
   NO_VIDEO: '탭 영상을 캡처할 수 없습니다. 탭이 화면에 표시되어 있는지 확인해주세요.',
   VIDEO_ENCODER_UNSUPPORTED: '이 브라우저는 H.264 영상 인코딩(WebCodecs)을 지원하지 않습니다. Chrome 94 이상이 필요합니다.',
   VIDEO_ENCODING_FAILED: '영상 인코딩에 실패했습니다.',
+  // 녹화 중 영상 파일을 저장 위치(폴더/OPFS)에 쓰지 못함 (권한 회수, 드라이브 분리, 디스크 부족 등) → 녹화를 멈추고 알림
+  VIDEO_WRITE_FAILED: '영상 파일을 저장 위치에 쓰지 못해 녹화를 중지했습니다. 저장 폴더의 연결·권한 상태와 남은 디스크 공간을 확인해주세요.',
   DOWNLOAD_FAILED: '파일 다운로드에 실패했습니다.',
   UNKNOWN: '알 수 없는 오류가 발생했습니다.'
 };
@@ -80,6 +98,7 @@ export const ERROR_MESSAGES = {
 export const RECORDING_STATES = {
   IDLE: 'IDLE',
   RECORDING: 'RECORDING',
+  PAUSED: 'PAUSED',         // 녹화 세션은 유지, 인코딩만 중단 (경과 시간도 멈춤)
   PROCESSING: 'PROCESSING'
 };
 
@@ -93,7 +112,18 @@ export const AUDIO_FORMATS = {
 export const VIDEO_FORMATS = {
   MP4: 'mp4',
   MOV: 'mov',
-  AVI: 'avi'
+  AVI: 'avi',
+  FMP4: 'fmp4' // 조각(fragmented) MP4: 녹화 중 약 2초마다 moof+mdat 조각을 바로 기록 → 빠른 종료, 비정상 종료 시에도 기록된 조각 보존
+};
+
+// 파일 확장자 - 포맷 값과 확장자가 다른 경우만 (fMP4는 일반 MP4 플레이어에서 열리도록 .mp4)
+export const FILE_EXTENSIONS = {
+  fmp4: 'mp4'
+};
+
+// 표시 이름 - 완료 메시지 등에 쓰는 포맷 이름 (없으면 포맷 값을 대문자로)
+export const FORMAT_LABELS = {
+  fmp4: 'MP4'
 };
 
 // Recording Modes - 녹화 모드

@@ -1,11 +1,13 @@
-import { MESSAGE_TYPES, RECORDING_STATES, SETTINGS, RECORDING_MODES, VIDEO_SETTINGS } from './constants.js';
-import { formatTime } from './utils.js';
+import { MESSAGE_TYPES, RECORDING_STATES, SETTINGS, RECORDING_MODES, VIDEO_SETTINGS, SAVE_LOCATIONS, DEFAULT_SETTINGS, STORAGE_KEYS } from './constants.js';
+import { formatTime, formatLabel } from './utils.js';
 import { loadSettings, saveSetting } from './storage.js';
+import { loadDirectoryHandle, queryFolderPermission, requestFolderPermission, folderDisplayName } from './save-location.js';
 
 // DOM 요소
 const skeleton = document.getElementById('skeleton');
 const mainContainer = document.getElementById('mainContainer');
 const recordButton = document.getElementById('recordButton');
+const pauseButton = document.getElementById('pauseButton');
 const statusElement = document.getElementById('status');
 const timeDisplay = document.getElementById('timeDisplay');
 const messageElement = document.getElementById('message');
@@ -16,6 +18,11 @@ const modeSelect = document.getElementById('modeSelect');
 const videoFormatSelect = document.getElementById('videoFormatSelect');
 const videoFormatGroup = document.getElementById('videoFormatGroup');
 const audioFormatGroup = document.getElementById('audioFormatGroup');
+const videoColumn = document.getElementById('videoColumn');
+const videoColumnNote = document.getElementById('videoColumnNote');
+const videoHint = document.getElementById('videoHint');
+const audioFormatNote = document.getElementById('audioFormatNote');
+const settingsButton = document.getElementById('settingsButton');
 
 // 녹음/녹화 중 비활성화할 설정 요소 목록
 const settingControls = () => [formatSelect, bitrateSelect, sampleRateSelect, modeSelect, videoFormatSelect].filter(Boolean);
@@ -26,6 +33,7 @@ function validateDOMElements() {
     skeleton,
     mainContainer,
     recordButton,
+    pauseButton,
     statusElement,
     timeDisplay,
     messageElement,
@@ -35,7 +43,12 @@ function validateDOMElements() {
     modeSelect,
     videoFormatSelect,
     videoFormatGroup,
-    audioFormatGroup
+    audioFormatGroup,
+    videoColumn,
+    videoColumnNote,
+    videoHint,
+    audioFormatNote,
+    settingsButton
   };
 
   const missingElements = [];
@@ -69,10 +82,20 @@ function validateDOMElements() {
 
 // 현재 상태
 let currentState = {
+  state: RECORDING_STATES.IDLE,
   isRecording: false,
   elapsed: 0,
   startTime: null
 };
+
+// 저장 위치 (chrome.storage.sync 미러: 설정 페이지가 폴더를 고르면 'folder' + 폴더 이름)
+// 팝업에는 표시하지 않고(저장 위치는 설정 페이지에서만 확인·변경), 녹화 시작 때 폴더 권한 확인 여부를 정하는 데만 사용
+let currentSaveLocation = { mode: SAVE_LOCATIONS.DOWNLOADS, name: '' };
+
+// 녹화 세션 진행 중 여부 (일시정지 포함): 중지 버튼과 일시정지/재개 버튼을 보여 주는 상태
+function isSessionActive(state) {
+  return state === RECORDING_STATES.RECORDING || state === RECORDING_STATES.PAUSED;
+}
 
 // 경과 시간 로컬 타이머 (Background 알람은 패키지 설치에서 30초 간격이라 보조 수단으로만 사용)
 let elapsedTimer = null;
@@ -115,6 +138,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (recordButton) {
       recordButton.addEventListener('click', handleButtonClick);
     }
+    if (pauseButton) {
+      pauseButton.addEventListener('click', handlePauseButtonClick);
+    }
     if (formatSelect) {
       formatSelect.addEventListener('change', handleFormatChange);
     }
@@ -129,6 +155,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     if (videoFormatSelect) {
       videoFormatSelect.addEventListener('change', handleVideoFormatChange);
+    }
+    if (settingsButton) {
+      settingsButton.addEventListener('click', openSettingsPage);
     }
   } catch (error) {
     console.error('초기화 실패:', error);
@@ -150,6 +179,56 @@ function showMainUI() {
   }
 }
 
+// 설정 페이지(options_page)에서 저장 폴더를 바꾸면 sync 미러가 바뀜 → 팝업을 다시 열지 않아도 다음 녹화 시작에 반영
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'sync' || !changes[STORAGE_KEYS.SETTINGS]) return;
+  applySaveLocationSetting({ ...DEFAULT_SETTINGS, ...(changes[STORAGE_KEYS.SETTINGS].newValue || {}) });
+});
+
+// 설정 페이지 열기 (헤더 ⚙ 버튼)
+async function openSettingsPage() {
+  try {
+    await chrome.runtime.openOptionsPage();
+  } catch (error) {
+    console.error('[Popup] 설정 페이지 열기 실패:', error);
+    showMessage('설정 페이지를 열 수 없습니다', 'error');
+  }
+}
+
+// 저장 위치 설정(sync 미러) 반영 - 화면 표시는 없음 (설정 페이지에서만 표시)
+function applySaveLocationSetting(settings) {
+  const folder = settings.saveLocationMode === SAVE_LOCATIONS.FOLDER;
+  currentSaveLocation = { mode: folder ? SAVE_LOCATIONS.FOLDER : SAVE_LOCATIONS.DOWNLOADS, name: folder ? (settings.saveLocationName || '') : '' };
+}
+
+// 녹화 시작 시 저장 위치 결정 (녹화 시작 클릭 = 사용자 제스처 안에서 호출)
+// 폴더 모드면 저장된 핸들의 쓰기 권한을 확인하고, granted가 아니면 requestPermission으로 요청합니다.
+// 핸들이 없거나 권한을 얻지 못하면 이번 녹화만 기존 다운로드 경로로 저장하고 안내합니다.
+async function resolveSaveLocationForStart() {
+  if (currentSaveLocation.mode !== SAVE_LOCATIONS.FOLDER) {
+    return { mode: SAVE_LOCATIONS.DOWNLOADS };
+  }
+  try {
+    const handle = await loadDirectoryHandle();
+    if (!handle) {
+      return { mode: SAVE_LOCATIONS.DOWNLOADS, notice: '저장 폴더 정보를 찾을 수 없어 이번 녹화는 다운로드 폴더에 저장합니다. 설정(⚙)에서 폴더를 다시 선택해주세요.' };
+    }
+    const name = folderDisplayName(handle);
+    let permission = await queryFolderPermission(handle);
+    if (permission !== 'granted') {
+      console.log('[Popup] 저장 폴더 권한 요청:', name, permission);
+      permission = await requestFolderPermission(handle);
+    }
+    if (permission === 'granted') {
+      return { mode: SAVE_LOCATIONS.FOLDER, name };
+    }
+    return { mode: SAVE_LOCATIONS.DOWNLOADS, notice: `'${name}' 폴더 쓰기 권한이 없어 이번 녹화는 다운로드 폴더에 저장합니다. 설정(⚙)에서 "권한 다시 요청"을 눌러주세요.` };
+  } catch (error) {
+    console.error('[Popup] 저장 폴더 확인 실패:', error);
+    return { mode: SAVE_LOCATIONS.DOWNLOADS, notice: `저장 폴더를 확인하지 못해 이번 녹화는 다운로드 폴더에 저장합니다. (${error.message})` };
+  }
+}
+
 // 메시지 리스너
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   console.log('Popup 메시지 수신:', message);
@@ -160,7 +239,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
 
     case MESSAGE_TYPES.UPDATE_TIME:
-      if (!elapsedTimer) updateTime(message.data.elapsed);
+      // 일시정지 중에는 멈춘 시간을 유지 (늦게 도착한 갱신 무시)
+      if (!elapsedTimer && currentState.state !== RECORDING_STATES.PAUSED) updateTime(message.data.elapsed);
       break;
 
     case MESSAGE_TYPES.ERROR:
@@ -242,12 +322,42 @@ async function loadCurrentState({ silent = false } = {}) {
   }
 }
 
-// 버튼 클릭 처리
+// 버튼 클릭 처리 (일시정지 중에도 중지 가능)
 async function handleButtonClick() {
-  if (currentState.isRecording) {
+  if (isSessionActive(currentState.state)) {
     await stopRecording();
   } else {
     await startRecording();
+  }
+}
+
+// 일시정지 / 재개 버튼 클릭 처리
+async function handlePauseButtonClick() {
+  const resuming = currentState.state === RECORDING_STATES.PAUSED;
+  if (!resuming && currentState.state !== RECORDING_STATES.RECORDING) return;
+
+  if (pauseButton) {
+    pauseButton.disabled = true;
+  }
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: resuming ? MESSAGE_TYPES.RESUME_RECORDING : MESSAGE_TYPES.PAUSE_RECORDING
+    });
+    if (!response || !response.success) {
+      throw new Error((response && response.error) || (resuming ? '재개에 실패했습니다' : '일시정지에 실패했습니다'));
+    }
+    // Background가 계산한 상태(일시정지 시점의 경과 시간, effectiveStartTime)로 즉시 반영. STATE_CHANGED도 뒤따라 옴
+    if (response.data) {
+      updateUI(response.data);
+    }
+  } catch (error) {
+    console.error(resuming ? '재개 실패:' : '일시정지 실패:', error);
+    showMessage(error.message, 'error');
+    await loadCurrentState({ silent: true });
+  } finally {
+    if (pauseButton && isSessionActive(currentState.state)) {
+      pauseButton.disabled = false;
+    }
   }
 }
 
@@ -257,6 +367,9 @@ async function startRecording() {
     if (recordButton) {
       recordButton.disabled = true;
     }
+
+    // 저장 위치 (폴더 권한 요청은 사용자 제스처가 살아 있는 지금, 다른 비동기 작업보다 먼저)
+    const saveLocation = await resolveSaveLocationForStart();
 
     // 현재 활성 탭 가져오기
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -279,7 +392,8 @@ async function startRecording() {
         tabId: tabId,
         format: selectedFormat,
         mode: selectedMode,
-        videoFormat: selectedVideoFormat
+        videoFormat: selectedVideoFormat,
+        saveLocation: saveLocation.mode
       }
     });
 
@@ -287,14 +401,19 @@ async function startRecording() {
       throw new Error(response.error);
     }
 
-    // [개선] 즉시 UI 업데이트
-    updateUI({
-      isRecording: true,
-      state: RECORDING_STATES.RECORDING,
-      elapsed: 0,
-      startTime: Date.now(),
-      mode: selectedMode
-    });
+    // [개선] 즉시 UI 업데이트 (Background가 보낸 상태가 있으면 그 startTime 기준으로 타이머 시작)
+    updateUI(response.data && response.data.state === RECORDING_STATES.RECORDING
+      ? response.data
+      : {
+        isRecording: true,
+        state: RECORDING_STATES.RECORDING,
+        elapsed: 0,
+        startTime: Date.now(),
+        mode: selectedMode
+      });
+    if (saveLocation.notice) {
+      showMessage(saveLocation.notice, 'info', { sticky: true });
+    }
   } catch (error) {
     console.error('녹음 시작 실패:', error);
     showMessage(error.message, 'error');
@@ -329,29 +448,56 @@ async function stopRecording() {
   }
 }
 
+// 일시정지/재개 버튼 표시 (녹화 중·일시정지 중에만 보임)
+function updatePauseButton(state) {
+  if (!pauseButton) return;
+  const visible = isSessionActive(state);
+  const isPaused = state === RECORDING_STATES.PAUSED;
+  pauseButton.classList.toggle('hidden', !visible);
+  pauseButton.classList.toggle('paused', isPaused);
+  pauseButton.textContent = isPaused ? '재개' : '일시정지';
+  pauseButton.disabled = !visible;
+}
+
 // UI 업데이트
 function updateUI(state) {
-  currentState.isRecording = state.isRecording;
+  const recordingState = state.state || (state.isRecording ? RECORDING_STATES.RECORDING : RECORDING_STATES.IDLE);
+  currentState.state = recordingState;
+  currentState.isRecording = recordingState === RECORDING_STATES.RECORDING;
   currentState.elapsed = state.elapsed || 0;
 
   const isVideoMode = (state.mode || (modeSelect && modeSelect.value)) !== RECORDING_MODES.AUDIO_ONLY;
+  const isPaused = recordingState === RECORDING_STATES.PAUSED;
+  updatePauseButton(recordingState);
+  if (timeDisplay) {
+    timeDisplay.classList.toggle('paused', isPaused);
+  }
 
-  if (state.isRecording) {
-    // 녹음/녹화 중
-    if (typeof state.startTime === 'number') {
-      startElapsedTimer(state.startTime);
+  if (isSessionActive(recordingState)) {
+    // 녹음/녹화 중 또는 일시정지 중
+    if (isPaused) {
+      // 일시정지: 자체 타이머를 멈추고 Background가 계산한 경과 시간(일시정지 시점 값)을 표시
+      stopElapsedTimer();
+    } else {
+      // 녹화 중: 일시정지 누적 시간만큼 뒤로 민 시작 시각 기준으로 타이머 진행 (재개 시 멈춘 값에서 이어짐)
+      const timerStart = typeof state.effectiveStartTime === 'number' ? state.effectiveStartTime : state.startTime;
+      if (typeof timerStart === 'number') {
+        startElapsedTimer(timerStart);
+      }
     }
     if (recordButton) {
       recordButton.textContent = isVideoMode ? '녹화 중지' : '녹음 중지';
       recordButton.classList.add('recording');
+      recordButton.classList.remove('processing');
       recordButton.disabled = false;
     }
     if (statusElement) {
-      statusElement.textContent = isVideoMode ? '녹화 중...' : '녹음 중...';
-      statusElement.classList.add('recording');
+      statusElement.textContent = isPaused ? '일시정지' : (isVideoMode ? '녹화 중...' : '녹음 중...');
+      statusElement.classList.toggle('recording', !isPaused);
+      statusElement.classList.toggle('paused', isPaused);
     }
     settingControls().forEach(el => { el.disabled = true; });
-  } else if (state.state === RECORDING_STATES.PROCESSING) {
+  } else if (recordingState === RECORDING_STATES.PROCESSING) {
     // 처리 중
     stopElapsedTimer();
     if (recordButton) {
@@ -363,6 +509,7 @@ function updateUI(state) {
     if (statusElement) {
       statusElement.textContent = '파일 생성 중...';
       statusElement.classList.remove('recording');
+      statusElement.classList.remove('paused');
     }
     settingControls().forEach(el => { el.disabled = true; });
   } else {
@@ -377,6 +524,7 @@ function updateUI(state) {
     if (statusElement) {
       statusElement.textContent = '대기 중';
       statusElement.classList.remove('recording');
+      statusElement.classList.remove('paused');
     }
     if (timeDisplay) {
       timeDisplay.textContent = '00:00';
@@ -388,12 +536,12 @@ function updateUI(state) {
     const completedFiles = Array.isArray(state.files) ? state.files : [];
     if (state.state === RECORDING_STATES.IDLE && completedFiles.length > 0) {
       if (state.saving) {
-        showMessage(`파일 ${completedFiles.length}개 저장 중... (${completedFiles.map(f => f.format.toUpperCase()).join(', ')})`, 'info', { sticky: true });
+        showMessage(`파일 ${completedFiles.length}개 저장 중... (${completedFiles.map(fileLabel).join(', ')})`, 'info', { sticky: true });
       } else {
         const failed = completedFiles.filter(f => f.downloadState && f.downloadState !== 'complete');
         const saved = completedFiles.filter(f => !failed.includes(f));
         if (saved.length > 0) {
-          showMessage(`녹화가 완료되어 ${saved.length}개 파일이 저장되었습니다. (${saved.map(f => f.format.toUpperCase()).join(', ')})`, 'success', { hideAfter: 5000 });
+          showMessage(describeSavedFiles(saved), 'success', { hideAfter: 5000 });
         }
       }
       currentState.elapsed = 0;
@@ -404,6 +552,26 @@ function updateUI(state) {
   }
 
   updateTime(currentState.elapsed);
+}
+
+// 파일 표시 이름 (fMP4는 .mp4 파일이므로 "MP4")
+function fileLabel(file) {
+  return file.label || formatLabel(file.format);
+}
+
+// 완료 메시지: 파일이 저장된 곳(선택한 폴더 / 다운로드 폴더)을 함께 알림
+function describeSavedFiles(files) {
+  const formats = (list) => list.map(fileLabel).join(', ');
+  const inFolder = files.filter(f => f.savedTo === SAVE_LOCATIONS.FOLDER);
+  const downloaded = files.filter(f => f.savedTo !== SAVE_LOCATIONS.FOLDER);
+  const folderName = inFolder.length ? (inFolder[0].location || '선택한 폴더') : '';
+  if (downloaded.length === 0) {
+    return `녹화가 완료되어 ${files.length}개 파일이 '${folderName}'에 저장되었습니다. (${formats(files)})`;
+  }
+  if (inFolder.length === 0) {
+    return `녹화가 완료되어 ${files.length}개 파일이 다운로드 폴더에 저장되었습니다. (${formats(files)})`;
+  }
+  return `녹화가 완료되었습니다. '${folderName}'에 ${inFolder.length}개 (${formats(inFolder)}), 다운로드 폴더에 ${downloaded.length}개 (${formats(downloaded)}) 저장되었습니다.`;
 }
 
 // 시간 표시 업데이트
@@ -460,22 +628,33 @@ async function loadUserSettings() {
     if (videoFormatSelect) {
       videoFormatSelect.value = settings.videoFormat || VIDEO_SETTINGS.DEFAULT_FORMAT;
     }
+    applySaveLocationSetting(settings);
     updateModeVisibility();
   } catch (error) {
     console.error('[Popup] 설정 로드 실패:', error);
   }
 }
 
-// 모드에 따라 영상/오디오 포맷 선택 UI 표시 전환
+// 모드별 설정 활성 규칙 (왼쪽 영상 열 / 오른쪽 오디오 열)
+// - AUDIO_ONLY: 영상 열은 보이되 비활성(회색) + "영상 녹화 안 함"
+// - VIDEO_AUDIO: 오디오 포맷만 비활성 + "영상 파일에 포함" (비트레이트·샘플레이트는 영상 파일 속 MP3에 적용되므로 활성)
+// - VIDEO_AUDIO_SPLIT: 모두 활성
+// 녹화·일시정지·처리 중에는 updateUI가 모든 설정을 비활성화하므로 선택 상자의 disabled는 대기 중에만 바꿈
 function updateModeVisibility() {
   const mode = modeSelect ? modeSelect.value : RECORDING_MODES.AUDIO_ONLY;
-  const showVideo = mode !== RECORDING_MODES.AUDIO_ONLY;
-  const showAudioFile = mode !== RECORDING_MODES.VIDEO_AUDIO;
+  const videoEnabled = mode !== RECORDING_MODES.AUDIO_ONLY;
+  const audioFileEnabled = mode !== RECORDING_MODES.VIDEO_AUDIO;
+  const locked = isSessionActive(currentState.state) || currentState.state === RECORDING_STATES.PROCESSING;
 
-  if (videoFormatGroup) videoFormatGroup.classList.toggle('hidden', !showVideo);
-  if (audioFormatGroup) audioFormatGroup.classList.toggle('hidden', !showAudioFile);
-  const videoHint = document.getElementById('videoHint');
-  if (videoHint) videoHint.classList.toggle('hidden', !showVideo);
+  if (videoColumn) videoColumn.classList.toggle('disabled', !videoEnabled);
+  if (videoColumnNote) videoColumnNote.classList.toggle('hidden', videoEnabled);
+  if (videoHint) videoHint.classList.toggle('hidden', !videoEnabled);
+  if (audioFormatGroup) audioFormatGroup.classList.toggle('disabled', !audioFileEnabled);
+  if (audioFormatNote) audioFormatNote.classList.toggle('hidden', audioFileEnabled);
+  if (!locked) {
+    if (videoFormatSelect) videoFormatSelect.disabled = !videoEnabled;
+    if (formatSelect) formatSelect.disabled = !audioFileEnabled;
+  }
 }
 
 // 녹화 모드 변경 핸들러

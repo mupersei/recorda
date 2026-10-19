@@ -1,4 +1,5 @@
 // Utility Functions - 공통 유틸리티 함수
+import { FILE_EXTENSIONS, FORMAT_LABELS } from './constants.js';
 
 /**
  * 초를 MM:SS 또는 HH:MM:SS 형식으로 변환
@@ -84,23 +85,52 @@ function sanitizeExtension(format, fallback) {
 }
 
 /**
+ * 포맷 값 → 파일 확장자 (예: fmp4 → mp4). 표에 없으면 포맷 값 그대로
+ * @param {string} format
+ * @returns {string}
+ */
+export function fileExtension(format) {
+  return (typeof format === 'string' && FILE_EXTENSIONS[format]) || format;
+}
+
+/**
+ * 포맷 값 → 표시 이름 (예: fmp4 → MP4, wav → WAV)
+ * @param {string} format
+ * @returns {string}
+ */
+export function formatLabel(format) {
+  if (typeof format !== 'string' || format.length === 0) return '';
+  return FORMAT_LABELS[format] || format.toUpperCase();
+}
+
+/**
+ * 녹화 파일의 공통 이름(확장자 제외)
+ * @param {Date} [date] - 기준 시각 (녹화 시작 시각)
+ * @returns {string} 예: recorda_20261016_120000
+ */
+export function recordingBaseName(date = new Date()) {
+  return `recorda_${formatDate(date)}`;
+}
+
+/**
  * 녹화 출력 목록에 대해 같은 타임스탬프를 공유하는 파일명을 생성
  * @param {Array<{kind: string, format: string}>} outputs - 출력 목록
  * @param {Date} [date] - 기준 시각 (기본값: 현재 시간)
+ * @param {{baseName?: string}} [options] - baseName: 확장자를 뺀 이름을 직접 지정 (예: 폴더에 같은 이름이 있어 " (1)"을 붙인 경우)
  * @returns {Array<{kind: string, format: string, filename: string}>}
  */
-export function generateRecordingFilenames(outputs, date = new Date()) {
+export function generateRecordingFilenames(outputs, date = new Date(), { baseName = null } = {}) {
   if (!Array.isArray(outputs)) {
     console.error('[Utils] generateRecordingFilenames: outputs가 배열이 아닙니다:', outputs);
     return [];
   }
 
-  const timestamp = formatDate(date);
+  const base = typeof baseName === 'string' && baseName.trim().length > 0 ? baseName : recordingBaseName(date);
 
   return outputs.map((output) => {
     const fallback = output.kind === 'video' ? 'mp4' : 'mp3';
-    const ext = sanitizeExtension(output.format, fallback);
-    return { ...output, filename: `recorda_${timestamp}.${ext}` };
+    const ext = sanitizeExtension(fileExtension(output.format), fallback);
+    return { ...output, filename: `${base}.${ext}` };
   });
 }
 
@@ -170,4 +200,21 @@ export function getElapsedTime(startTime) {
 export function getElapsedSeconds(startTime) {
   // 입력 검증은 getElapsedTime에서 수행됨
   return Math.floor(getElapsedTime(startTime) / 1000);
+}
+
+/**
+ * 일시정지 시간을 뺀 녹화 경과 시간 (초)
+ * - 일시정지 중(pausedAt 있음)이면 일시정지한 시각에서 멈춘 값을 반환합니다.
+ * @param {{startTime?: number, pausedTotalMs?: number, pausedAt?: number|null}} timing
+ *   startTime: 녹화 시작 시각, pausedTotalMs: 끝난 일시정지들의 누적 시간, pausedAt: 진행 중인 일시정지의 시작 시각
+ * @param {number} [now] - 기준 시각 (기본값: Date.now())
+ * @returns {number} 경과 시간 (초, 내림)
+ */
+export function getActiveElapsedSeconds({ startTime, pausedTotalMs = 0, pausedAt = null } = {}, now = Date.now()) {
+  if (typeof startTime !== 'number' || !isFinite(startTime)) {
+    return 0;
+  }
+  const end = typeof pausedAt === 'number' && isFinite(pausedAt) ? pausedAt : now;
+  const activeMs = end - startTime - (Number(pausedTotalMs) || 0);
+  return activeMs > 0 ? Math.floor(activeMs / 1000) : 0;
 }

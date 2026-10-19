@@ -202,3 +202,35 @@ test('AVI: 스트리밍 작성 시 예상 크기가 2GB를 넘으면 쓰기 전�
   await vStore.finalize();
   await assert.rejects(() => writeAvi({ video: big, audio: null, frameRate: 30, output: new MemoryFileSink('video/x-msvideo') }), /2GB/);
 });
+
+test('AVI 스트리밍 쓰기는 청크마다 쓰거나 읽지 않고 묶어서 처리한다', async () => {
+  const vStore = new MemoryChunkStore();
+  const aStore = new MemoryChunkStore();
+  const storedVideo = { ...video, store: vStore, samples: video.samples.map(s => ({ ref: vStore.append(s.data), nalCount: countNalUnits(s.data, 4), timestamp: s.timestamp, keyframe: s.keyframe })) };
+  const storedAudio = { ...audio, store: aStore, frames: audio.frames.map(f => ({ ref: aStore.append(f.data), samples: f.samples })) };
+  await vStore.finalize();
+  await aStore.finalize();
+  let reads = 0;
+  for (const st of [vStore, aStore]) { const o = st.readRange.bind(st); st.readRange = (a, b) => { reads++; return o(a, b); };
+    const oi = st.readInto.bind(st); st.readInto = (a, b, c) => { reads++; return oi(a, b, c); }; }
+  const sink = new MemoryFileSink('video/x-msvideo');
+  let writes = 0;
+  const orig = sink.write.bind(sink);
+  sink.write = (d) => { writes++; return orig(d); };
+  await writeAvi({ video: storedVideo, audio: storedAudio, frameRate: 30, output: sink });
+  assert.ok(writes <= 3, `write ${writes}회`);
+  assert.ok(reads <= 2, `readRange ${reads}회 (영상 샘플 ${storedVideo.samples.length}개)`);
+});
+
+test('AVI 스트리밍 쓰기는 저장소 조각(Blob slice)을 만들지 않는다', async () => {
+  const vStore = new MemoryChunkStore();
+  const aStore = new MemoryChunkStore();
+  const storedVideo = { ...video, store: vStore, samples: video.samples.map(s => ({ ref: vStore.append(s.data), nalCount: countNalUnits(s.data, 4), timestamp: s.timestamp, keyframe: s.keyframe })) };
+  const storedAudio = { ...audio, store: aStore, frames: audio.frames.map(f => ({ ref: aStore.append(f.data), samples: f.samples })) };
+  await vStore.finalize();
+  await aStore.finalize();
+  let slices = 0;
+  for (const st of [vStore, aStore]) st.slice = async () => { slices++; throw new Error('slice 사용 금지'); };
+  await writeAvi({ video: storedVideo, audio: storedAudio, frameRate: 30, output: new MemoryFileSink('video/x-msvideo') });
+  assert.equal(slices, 0);
+});

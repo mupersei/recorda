@@ -1,6 +1,8 @@
 // AVI 머서 - H.264(Annex B, 'H264' fourcc) 영상 + MP3 오디오를 RIFF AVI 컨테이너로 작성
 import { ByteWriter, fourcc } from './byte-writer.js';
 import { avcToAnnexB, parseAvcC } from './h264.js';
+import { BatchWriter, SequentialReader } from './batch-io.js';
+import { videoSource, audioSource, readSampleData } from './sample-access.js';
 
 const AVIF_HASINDEX = 0x00000010;
 const AVIF_ISINTERLEAVED = 0x00000100;
@@ -52,109 +54,155 @@ function parameterSetBytes(avcC) {
   return [...sps, ...pps].reduce((s, n) => s + 4 + n.length, 0);
 }
 
-/** 샘플의 Annex B 변환 후 크기 (데이터가 있으면 실제 변환 길이, 없으면 ref.size + nalCount 기반 계산) */
-function annexBSize(sample, avcC, nalLengthSize, psBytes) {
-  if (sample.data) return avcToAnnexB(sample.data, avcC, !!sample.keyframe).length;
-  if (!sample.ref || typeof sample.nalCount !== 'number') {
+/** AVC 샘플을 Annex B로 바꿨을 때의 길이 (avcToAnnexB(...).length와 같음, 변환 버퍼를 만들지 않음) */
+function annexBLength(avcSample, nalLengthSize, keyframe, psBytes) {
+  let total = keyframe ? psBytes : 0;
+  let off = 0;
+  while (off + nalLengthSize <= avcSample.length) {
+    let len = 0;
+    for (let i = 0; i < nalLengthSize; i++) len = (len << 8) | avcSample[off + i];
+    off += nalLengthSize;
+    if (len <= 0 || off + len > avcSample.length) break;
+    total += 4 + len;
+    off += len;
+  }
+  return total;
+}
+
+/** 영상 샘플 i의 Annex B 변환 후 크기 (데이터가 있으면 실제 변환 길이, 없으면 저장소 크기 + nalCount 기반 계산) */
+function videoChunkSize(vsrc, i, nalLengthSize, psBytes) {
+  const keyframe = vsrc.keyframeAt(i);
+  const data = vsrc.dataAt(i);
+  if (data) return annexBLength(data, nalLengthSize, keyframe, psBytes);
+  const nalCount = vsrc.nalCountAt(i);
+  if (!vsrc.hasRefAt(i) || typeof nalCount !== 'number') {
     throw new Error('저장소 참조 샘플에는 ref와 nalCount가 필요합니다');
   }
-  return sample.ref.size + (4 - nalLengthSize) * sample.nalCount + (sample.keyframe ? psBytes : 0);
+  return vsrc.sizeAt(i) + (4 - nalLengthSize) * nalCount + (keyframe ? psBytes : 0);
 }
+
+// order 값: 슬롯의 영상 샘플 / 빈 슬롯(길이 0 청크) / 오디오 프레임
+const CHUNK_VIDEO = 0;
+const CHUNK_EMPTY = 1;
+const CHUNK_AUDIO = 2;
+const ID_VIDEO = [0x30, 0x30, 0x64, 0x63]; // '00dc'
+const ID_AUDIO = [0x30, 0x31, 0x77, 0x62]; // '01wb'
 
 /**
  * AVI 레이아웃 계산 (공통). 청크 데이터는 읽지 않고 크기만 사용합니다.
+ * 샘플마다 객체를 만들지 않고, 청크 순서는 Uint8Array(order), 색인(idx1)은 정확한 크기의 버퍼 하나에 바로 씁니다.
+ * @returns {{head:Uint8Array, order:Uint8Array, idx1:Uint8Array, video:Object, audio:Object|null, avcC:Uint8Array, totalBytes:number}}
  */
 export function planAvi({ video, audio = null, frameRate = 30 }) {
-  if (!video || !Array.isArray(video.samples) || video.samples.length === 0) {
+  const vsrc = videoSource(video);
+  if (!vsrc || vsrc.count === 0) {
     throw new Error('영상 샘플이 없습니다');
   }
   if (audio && audio.codec !== 'mp3') {
     throw new Error(`지원하지 않는 컨테이너 오디오 코덱입니다: ${audio.codec}`);
   }
-  if (audio && (!Array.isArray(audio.frames) || audio.frames.length === 0)) {
+  let asrc = audioSource(audio);
+  if (!asrc || asrc.count === 0) {
     audio = null;
+    asrc = null;
   }
   const nalLengthSize = parseAvcC(video.avcC).nalLengthSize;
   const psBytes = parameterSetBytes(video.avcC);
+  const nV = vsrc.count;
+  const nA = asrc ? asrc.count : 0;
 
-  // ---- 비디오 청크 (슬롯 기준, 빈 슬롯은 길이 0) ----
-  const slots = assignFrameSlots(video.samples.map(s => s.timestamp), frameRate);
+  // ---- 비디오 청크 (슬롯 기준, 빈 슬롯은 길이 0): assignFrameSlots와 같은 계산을 배열 없이 ----
+  const origin = vsrc.timestampAt(0);
   const slotDurationUs = 1_000_000 / frameRate;
-  let totalSlots = slots[slots.length - 1] + 1;
+  const slotOf = (i, prev) => {
+    let slot = Math.round((vsrc.timestampAt(i) - origin) / slotDurationUs);
+    if (slot <= prev) slot = prev + 1;
+    return slot;
+  };
+  let lastSlot = -1;
+  let totalBytes = 0, maxChunk = 0;
+  for (let i = 0; i < nV; i++) {
+    lastSlot = slotOf(i, lastSlot);
+    const size = videoChunkSize(vsrc, i, nalLengthSize, psBytes);
+    totalBytes += size;
+    if (size > maxChunk) maxChunk = size;
+  }
+  let totalSlots = lastSlot + 1;
   // 오디오가 더 길면 빈 슬롯을 덧붙여 dwTotalFrames가 오디오 길이를 덮게 함
-  if (audio) {
-    const audioSamples = audio.frames.reduce((s, f) => s + f.samples, 0);
+  let audioSamples = 0;
+  for (let j = 0; j < nA; j++) {
+    audioSamples += asrc.samplesAt(j);
+    const size = asrc.sizeAt(j);
+    totalBytes += size;
+    if (size > maxChunk) maxChunk = size;
+  }
+  if (asrc) {
     const audioSlots = Math.ceil(audioSamples / audio.sampleRate * frameRate);
     if (audioSlots > totalSlots) totalSlots = audioSlots;
   }
-  const videoChunks = new Array(totalSlots);
-  video.samples.forEach((s, i) => {
-    videoChunks[slots[i]] = {
-      id: '00dc',
-      size: annexBSize(s, video.avcC, nalLengthSize, psBytes),
-      keyframe: !!s.keyframe,
-      source: { data: s.data, ref: s.ref, store: video.store, convert: true, keyframe: !!s.keyframe }
-    };
-  });
-  for (let i = 0; i < totalSlots; i++) {
-    if (!videoChunks[i]) videoChunks[i] = { id: '00dc', size: 0, keyframe: false, source: null };
-  }
-
-  // ---- 오디오 청크 (MP3 프레임 1개 = 청크 1개) ----
-  const audioChunks = [];
-  if (audio) {
-    let samplePos = 0;
-    for (const f of audio.frames) {
-      const size = f.data ? f.data.length : f.ref.size;
-      audioChunks.push({ id: '01wb', size, keyframe: true, timeUs: samplePos * 1_000_000 / audio.sampleRate, source: { data: f.data, ref: f.ref, store: audio.store, convert: false } });
-      samplePos += f.samples;
-    }
-  }
-
-  // ---- 인터리빙: 슬롯 i 비디오 → 해당 슬롯 종료 시각 이전 오디오 ----
-  const ordered = [];
-  let audioIndex = 0;
-  for (let i = 0; i < totalSlots; i++) {
-    ordered.push(videoChunks[i]);
-    const slotEnd = (i + 1) * slotDurationUs;
-    while (audioIndex < audioChunks.length && (audioChunks[audioIndex].timeUs < slotEnd || i === totalSlots - 1)) {
-      ordered.push(audioChunks[audioIndex++]);
-    }
-  }
 
   // ---- 헤더 ----
-  const maxChunk = ordered.reduce((m, c) => Math.max(m, c.size), 0);
-  const totalBytes = ordered.reduce((s, c) => s + c.size, 0);
-  const estimatedSize = totalBytes + ordered.length * 24 + 1024;
+  const chunkCount = totalSlots + nA;
+  const estimatedSize = totalBytes + chunkCount * 24 + 1024;
   if (estimatedSize > AVI_MAX_BYTES) {
     throw new Error(`AVI 파일 크기 한계(2GB)를 초과합니다: 약 ${(estimatedSize / 1024 / 1024 / 1024).toFixed(2)} GB`);
   }
   const durationSec = totalSlots / frameRate;
-  const hdrl = buildHdrl({ video, audio, frameRate, totalSlots, maxChunk, bytesPerSec: Math.ceil(totalBytes / Math.max(durationSec, 1e-6)), audioChunkCount: audioChunks.length });
+  const hdrl = buildHdrl({ video, audio, asrc, frameRate, totalSlots, maxChunk, bytesPerSec: Math.ceil(totalBytes / Math.max(durationSec, 1e-6)), audioChunkCount: nA });
+
+  // ---- 인터리빙: 슬롯 i 비디오 → 해당 슬롯 종료 시각 이전 오디오 (+ idx1 항목) ----
+  const order = new Uint8Array(chunkCount);
+  const idx1 = new Uint8Array(8 + chunkCount * 16);
+  const view = new DataView(idx1.buffer);
+  idx1.set([0x69, 0x64, 0x78, 0x31]); // 'idx1'
+  view.setUint32(4, chunkCount * 16, true);
+  let pos = 8;
+  let offsetInMovi = 4; // 'movi' fourcc 기준
+  const addEntry = (id, flags, size) => {
+    idx1.set(id, pos);
+    view.setUint32(pos + 4, flags, true);
+    view.setUint32(pos + 8, offsetInMovi, true);
+    view.setUint32(pos + 12, size, true);
+    pos += 16;
+    offsetInMovi += 8 + size + (size & 1);
+  };
+  let k = 0, vi = 0, ai = 0, samplePos = 0;
+  let nextSlot = nV > 0 ? slotOf(0, -1) : Infinity;
+  for (let i = 0; i < totalSlots; i++) {
+    if (vi < nV && nextSlot === i) {
+      order[k++] = CHUNK_VIDEO;
+      addEntry(ID_VIDEO, vsrc.keyframeAt(vi) ? AVIIF_KEYFRAME : 0, videoChunkSize(vsrc, vi, nalLengthSize, psBytes));
+      vi++;
+      if (vi < nV) nextSlot = slotOf(vi, nextSlot);
+    } else {
+      order[k++] = CHUNK_EMPTY;
+      addEntry(ID_VIDEO, 0, 0);
+    }
+    const slotEnd = (i + 1) * slotDurationUs;
+    while (ai < nA && (samplePos * 1_000_000 / audio.sampleRate < slotEnd || i === totalSlots - 1)) {
+      order[k++] = CHUNK_AUDIO;
+      addEntry(ID_AUDIO, AVIIF_KEYFRAME, asrc.sizeAt(ai));
+      samplePos += asrc.samplesAt(ai);
+      ai++;
+    }
+  }
+  const moviSize = offsetInMovi; // 4('movi') + Σ(8 + size + pad)
 
   // ---- movi + idx1 ----
   const moviHeader = new ByteWriter(12);
-  const moviSize = 4 + ordered.reduce((s, c) => s + 8 + c.size + (c.size & 1), 0);
   moviHeader.ascii('LIST').u32le(moviSize).ascii('movi');
-
-  const idx1 = new ByteWriter(8 + ordered.length * 16);
-  idx1.ascii('idx1').u32le(ordered.length * 16);
-  let offsetInMovi = 4; // 'movi' fourcc 기준
-  for (const chunk of ordered) {
-    const header = new ByteWriter(8);
-    header.ascii(chunk.id).u32le(chunk.size);
-    chunk.header = header.bytes().slice();
-    chunk.pad = chunk.size & 1;
-    idx1.ascii(chunk.id).u32le(chunk.keyframe ? AVIIF_KEYFRAME : 0).u32le(offsetInMovi).u32le(chunk.size);
-    offsetInMovi += 8 + chunk.size + chunk.pad;
-  }
 
   const riffHeader = new ByteWriter(12);
   const riffSize = 4 + hdrl.length + (8 + moviSize) + idx1.length;
   riffHeader.ascii('RIFF').u32le(riffSize).ascii('AVI ');
 
-  const head = concatParts([riffHeader.bytes().slice(), hdrl, moviHeader.bytes().slice()]);
-  return { head, chunks: ordered, idx1: idx1.bytes().slice(), avcC: video.avcC, totalBytes: riffSize + 8 };
+  const head = concatParts([riffHeader.bytes(), hdrl, moviHeader.bytes()]);
+  const { sps, pps } = parseAvcC(video.avcC);
+  return {
+    head, order, idx1, video: vsrc, audio: asrc, avcC: video.avcC, totalBytes: riffSize + 8,
+    nalLengthSize, psBytes, parameterSets: [...sps, ...pps],
+    videoChunkSize: (i) => videoChunkSize(vsrc, i, nalLengthSize, psBytes)
+  };
 }
 
 function concatParts(parts) {
@@ -164,15 +212,11 @@ function concatParts(parts) {
   return out;
 }
 
-/** 청크 소스를 AVI에 쓸 바이트로 (영상은 Annex B 변환) */
-async function readChunk(source, avcC) {
-  let bytes = source.data;
-  if (!bytes) {
-    if (!source.store) throw new Error('저장소 참조 샘플에는 store가 필요합니다');
-    if (!source.convert) return source.store.slice(source.ref.offset, source.ref.size); // 오디오: 복사 없이 Blob 조각
-    bytes = await source.store.readRange(source.ref.offset, source.ref.size);
-  }
-  return source.convert ? avcToAnnexB(bytes, avcC, source.keyframe) : bytes;
+function chunkHeader(id, size) {
+  const h = new Uint8Array(8);
+  h.set(id);
+  new DataView(h.buffer).setUint32(4, size, true);
+  return h;
 }
 
 /**
@@ -187,38 +231,96 @@ async function readChunk(source, avcC) {
 export function buildAvi(options) {
   const plan = planAvi(options);
   const parts = [plan.head];
-  for (const chunk of plan.chunks) {
-    parts.push(chunk.header);
-    if (chunk.source) {
-      if (!chunk.source.data) throw new Error('buildAvi는 메모리 샘플(data)만 지원합니다. 저장소 참조는 writeAvi를 사용하세요.');
-      parts.push(chunk.source.convert ? avcToAnnexB(chunk.source.data, plan.avcC, chunk.source.keyframe) : chunk.source.data);
-    }
-    if (chunk.pad) parts.push(new Uint8Array(1));
+  const { order, video, audio } = plan;
+  let vi = 0, ai = 0;
+  for (let k = 0; k < order.length; k++) {
+    if (order[k] === CHUNK_EMPTY) { parts.push(chunkHeader(ID_VIDEO, 0)); continue; }
+    const isVideo = order[k] === CHUNK_VIDEO;
+    const data = isVideo ? video.dataAt(vi) : audio.dataAt(ai);
+    if (!data) throw new Error('buildAvi는 메모리 샘플(data)만 지원합니다. 저장소 참조는 writeAvi를 사용하세요.');
+    const body = isVideo ? avcToAnnexB(data, plan.avcC, video.keyframeAt(vi)) : data;
+    parts.push(chunkHeader(isVideo ? ID_VIDEO : ID_AUDIO, body.length), body);
+    if (body.length & 1) parts.push(new Uint8Array(1));
+    if (isVideo) vi++; else ai++;
   }
   parts.push(plan.idx1);
   return parts;
 }
 
+const START_CODE = new Uint8Array([0, 0, 0, 1]);
+const PAD = new Uint8Array(1);
+
 /**
- * AVI 파일을 출력 싱크에 스트리밍으로 씁니다. 영상 샘플은 한 번에 하나씩 읽어 Annex B로 변환하므로
- * 메모리 사용량이 파일 크기와 무관합니다. 저장소 참조 영상 샘플에는 nalCount가 있어야 합니다.
- * @returns {Promise<{blob:Blob, bytes:number}>}
+ * AVC 샘플(길이 접두)을 Annex B로 바꿔 BatchWriter에 바로 씁니다: 시작 코드와 NAL 뷰만 넘기므로
+ * 샘플마다 변환 버퍼를 만들지 않습니다 (버퍼 복사는 BatchWriter의 고정 버퍼로 한 번만).
+ */
+async function addAnnexB(writer, avc, plan, keyframe) {
+  if (keyframe) {
+    for (const nal of plan.parameterSets) { await writer.add(START_CODE); await writer.add(nal); }
+  }
+  const n = plan.nalLengthSize;
+  let off = 0;
+  while (off + n <= avc.length) {
+    let len = 0;
+    for (let i = 0; i < n; i++) len = (len << 8) | avc[off + i];
+    off += n;
+    if (len <= 0 || off + len > avc.length) break;
+    await writer.add(START_CODE);
+    await writer.add(avc.subarray(off, off + len));
+    off += len;
+  }
+}
+
+/**
+ * AVI 파일을 출력 싱크에 스트리밍으로 씁니다. 영상 샘플은 저장소에서 순차로 읽어 Annex B로 바꾸며 바로 쓰므로
+ * 메모리 사용량이 파일 크기와 무관합니다. 저장소 참조 영상 샘플에는 nalCount가 있어야 합니다(SampleIndex는 항상 보유).
+ * @returns {Promise<{blob:Blob, bytes:number, timings:{planMs:number, writeMs:number, closeMs:number}}>}
  */
 export async function writeAvi({ output, ...options }) {
   if (!output || typeof output.write !== 'function') {
     throw new Error('출력 싱크(output)가 필요합니다');
   }
+  const now = () => (globalThis.performance ? performance.now() : Date.now());
+  const t0 = now();
   const plan = planAvi(options);
-  const pad = new Uint8Array(1);
-  await output.write(plan.head);
-  for (const chunk of plan.chunks) {
-    await output.write(chunk.header);
-    if (chunk.source) await output.write(await readChunk(chunk.source, plan.avcC));
-    if (chunk.pad) await output.write(pad);
+  const t1 = now();
+  const writer = new BatchWriter(output);
+  const readers = new Map();
+  const makeReader = (store) => new SequentialReader(store);
+  const header = new Uint8Array(8);
+  const headerView = new DataView(header.buffer);
+  const addHeader = (id, size) => { header.set(id); headerView.setUint32(4, size, true); return writer.add(header); };
+  const { order, video, audio } = plan;
+  await writer.add(plan.head);
+  let vi = 0, ai = 0;
+  for (let k = 0; k < order.length; k++) {
+    const kind = order[k];
+    if (kind === CHUNK_EMPTY) {
+      await addHeader(ID_VIDEO, 0);
+    } else if (kind === CHUNK_VIDEO) {
+      const size = plan.videoChunkSize(vi);
+      await addHeader(ID_VIDEO, size);
+      const start = writer.position;
+      const avc = await readSampleData(video, vi, readers, makeReader);
+      await addAnnexB(writer, avc, plan, video.keyframeAt(vi));
+      if (writer.position - start !== size) {
+        throw new Error(`AVI 영상 청크 크기 불일치 (샘플 ${vi}: 예상 ${size}, 실제 ${writer.position - start}) - nalCount를 확인하세요`);
+      }
+      if (size & 1) await writer.add(PAD);
+      vi++;
+    } else {
+      const size = audio.sizeAt(ai);
+      await addHeader(ID_AUDIO, size);
+      await writer.add(await readSampleData(audio, ai, readers, makeReader));
+      if (size & 1) await writer.add(PAD);
+      ai++;
+    }
   }
-  await output.write(plan.idx1);
+  await writer.add(plan.idx1);
+  await writer.flush();
+  const t2 = now();
   const blob = await output.close();
-  return { blob, bytes: plan.totalBytes };
+  return { blob, bytes: plan.totalBytes, timings: { planMs: Math.round(t1 - t0), writeMs: Math.round(t2 - t1), closeMs: Math.round(now() - t2) } };
 }
 
 function list(type, ...payloads) {
@@ -236,7 +338,7 @@ function chunk(id, body) {
   return w.bytes().slice();
 }
 
-function buildHdrl({ video, audio, frameRate, totalSlots, maxChunk, bytesPerSec, audioChunkCount }) {
+function buildHdrl({ video, audio, asrc, frameRate, totalSlots, maxChunk, bytesPerSec, audioChunkCount }) {
   const avih = new ByteWriter(56);
   avih.u32le(Math.round(1_000_000 / frameRate)); // dwMicroSecPerFrame
   avih.u32le(bytesPerSec);                        // dwMaxBytesPerSec
@@ -251,7 +353,7 @@ function buildHdrl({ video, audio, frameRate, totalSlots, maxChunk, bytesPerSec,
   avih.zeros(16);                                 // dwReserved[4]
 
   const parts = [chunk('avih', avih.bytes()), buildVideoStrl({ video, frameRate, totalSlots, maxChunk })];
-  if (audio) parts.push(buildAudioStrl({ audio, audioChunkCount }));
+  if (audio) parts.push(buildAudioStrl({ audio, asrc, audioChunkCount }));
   return list('hdrl', ...parts);
 }
 
@@ -285,10 +387,11 @@ function buildVideoStrl({ video, frameRate, totalSlots, maxChunk }) {
   return list('strl', chunk('strh', strh.bytes()), chunk('strf', strf.bytes()));
 }
 
-function buildAudioStrl({ audio, audioChunkCount }) {
-  const bitrate = audio.bitrate || estimateBitrate(audio);
-  const maxFrame = audio.frames.reduce((m, f) => Math.max(m, f.data ? f.data.length : f.ref.size), 0);
-  const samplesPerFrame = audio.frames[0].samples || 1152; // MPEG-1: 1152, MPEG-2: 576
+function buildAudioStrl({ audio, asrc, audioChunkCount }) {
+  const bitrate = audio.bitrate || estimateBitrate(asrc, audio.sampleRate);
+  let maxFrame = 0;
+  for (let i = 0; i < asrc.count; i++) maxFrame = Math.max(maxFrame, asrc.sizeAt(i));
+  const samplesPerFrame = asrc.samplesAt(0) || 1152; // MPEG-1: 1152, MPEG-2: 576
 
   const strh = new ByteWriter(56);
   strh.u32le(fourcc('auds'));
@@ -325,8 +428,8 @@ function buildAudioStrl({ audio, audioChunkCount }) {
   return list('strl', chunk('strh', strh.bytes()), chunk('strf', strf.bytes()));
 }
 
-function estimateBitrate(audio) {
-  const bytes = audio.frames.reduce((s, f) => s + (f.data ? f.data.length : f.ref.size), 0);
-  const samples = audio.frames.reduce((s, f) => s + f.samples, 0);
-  return samples > 0 ? Math.round(bytes * 8 * audio.sampleRate / samples) : 128000;
+function estimateBitrate(asrc, sampleRate) {
+  let bytes = 0, samples = 0;
+  for (let i = 0; i < asrc.count; i++) { bytes += asrc.sizeAt(i); samples += asrc.samplesAt(i); }
+  return samples > 0 ? Math.round(bytes * 8 * sampleRate / samples) : 128000;
 }

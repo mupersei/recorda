@@ -232,3 +232,27 @@ test('MP4: 스트리밍 작성은 샘플 데이터를 한꺼번에 메모리에 
   const biggest = Math.max(...video.samples.map(s => s.data.length));
   assert.ok(maxRead <= biggest, `maxRead=${maxRead}`);
 });
+
+test('MP4 스트리밍 쓰기는 샘플마다 쓰지 않고 묶어서 쓴다 (출력 write 호출 수 ≪ 샘플 수)', async () => {
+  const { storedVideo, storedAudio } = await toStoreBacked(() => new MemoryChunkStore());
+  const sink = new MemoryFileSink('video/mp4');
+  let writes = 0;
+  const orig = sink.write.bind(sink);
+  sink.write = (d) => { writes++; return orig(d); };
+  await writeMp4({ container: 'mp4', video: storedVideo, audio: storedAudio, output: sink });
+  const sampleCount = storedVideo.samples.length + storedAudio.frames.length;
+  assert.ok(writes <= 3, `write ${writes}회 (샘플 ${sampleCount}개)`);
+});
+
+test('MP4 스트리밍 쓰기는 저장소 조각(Blob slice)을 만들지 않고 큰 단위 순차 읽기만 한다', async () => {
+  const { storedVideo, storedAudio } = await toStoreBacked(() => new MemoryChunkStore());
+  let slices = 0, reads = 0;
+  for (const st of [storedVideo.store, storedAudio.store]) {
+    st.slice = async () => { slices++; throw new Error('slice 사용 금지'); };
+    const o = st.readRange.bind(st); st.readRange = (a, b) => { reads++; return o(a, b); };
+    const oi = st.readInto.bind(st); st.readInto = (a, b, c) => { reads++; return oi(a, b, c); };
+  }
+  await writeMp4({ container: 'mp4', video: storedVideo, audio: storedAudio, output: new MemoryFileSink('video/mp4') });
+  assert.equal(slices, 0);
+  assert.ok(reads <= 2, `readRange ${reads}회`);
+});

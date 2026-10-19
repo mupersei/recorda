@@ -37,6 +37,14 @@ test('VIDEO_AUDIO_SPLIT 모드는 영상 파일 1개와 오디오 파일 1개를
   ]);
 });
 
+test('영상 포맷으로 fMP4(조각 MP4, fmp4)를 고를 수 있다 (MOV/AVI와 같은 영상 출력 + 컨테이너 오디오 MP3)', () => {
+  assert.equal(VIDEO_FORMATS.FMP4, 'fmp4');
+  const single = resolveRecordingPlan({ mode: RECORDING_MODES.VIDEO_AUDIO, videoFormat: VIDEO_FORMATS.FMP4 });
+  assert.deepEqual(single.outputs, [{ kind: 'video', format: 'fmp4', audioCodec: 'mp3' }]);
+  const split = resolveRecordingPlan({ mode: RECORDING_MODES.VIDEO_AUDIO_SPLIT, audioFormat: 'wav', videoFormat: 'fmp4' });
+  assert.deepEqual(split.outputs, [{ kind: 'video', format: 'fmp4', audioCodec: 'mp3' }, { kind: 'audio', format: 'wav' }]);
+});
+
 test('mode가 없으면 기존 동작(AUDIO_ONLY)으로 해석한다', () => {
   const plan = resolveRecordingPlan({ audioFormat: 'mp3' });
   assert.equal(plan.mode, RECORDING_MODES.AUDIO_ONLY);

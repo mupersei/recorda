@@ -11,35 +11,78 @@
       box-sizing: border-box;
     }
 
+    /* 높이가 사용자 한글 폰트(맑은 고딕, Apple SD Gothic Neo, Noto Sans CJK 등)의 기본 줄 간격에 따라
+       달라지지 않도록 줄 높이·선택 상자 높이를 명시 (팝업 최대 높이 600px) */
     body {
-      width: 360px;
-      padding: 12px;
+      width: 420px;
+      padding: 10px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+      line-height: 1.35;
       background: #f5f5f5;
     }
 
     .container {
       background: white;
       border-radius: 12px;
-      padding: 16px 18px;
+      padding: 14px 18px;
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
     }
 
+    /* 헤더 한 줄: 제목 · 상태 · 설정(⚙)이 같은 높이(--header-line)의 줄 상자를 쓰고 세로 중앙선을 공유
+       (⚙는 상태 줄 상자와 같은 높이의 정사각형 버튼, 위쪽 여백·위치 보정 없음) */
     .header {
+      --header-line: 24px;
       display: flex;
-      align-items: baseline;
+      align-items: center;
       justify-content: space-between;
+      gap: 8px;
       margin-bottom: 4px;
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* 설정(⚙) 버튼: 저장 폴더 등 설정 페이지 열기. 글자 상자를 버튼 정중앙에 배치 (폰트별 줄 간격과 무관) */
+    .icon-button {
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: var(--header-line);
+      height: var(--header-line);
+      margin: 0;
+      padding: 0;
+      font-size: 16px;
+      line-height: 1;
+      color: #777;
+      background: transparent;
+      border-radius: 6px;
+    }
+
+    .icon-button:hover {
+      background: #f0f0f0;
+      color: #333;
+    }
+
+    .icon-button:focus-visible {
+      outline: 2px solid #4CAF50;
+      outline-offset: 1px;
     }
 
     .header h1 {
       font-size: 18px;
+      line-height: var(--header-line);
       font-weight: 600;
       color: #333;
     }
 
     .status {
       font-size: 13px;
+      line-height: var(--header-line);
+      white-space: nowrap;
       color: #666;
     }
 
@@ -48,15 +91,25 @@
       font-weight: 500;
     }
 
+    .status.paused {
+      color: #F57C00;
+      font-weight: 500;
+    }
+
     .time-display {
       font-size: 30px;
       font-weight: 300;
       color: #333;
       text-align: center;
-      margin: 6px 0 10px;
+      margin: 4px 0 8px;
       font-variant-numeric: tabular-nums;
       letter-spacing: 2px;
-      line-height: 1.1;
+      line-height: 34px;
+    }
+
+    /* 일시정지 중에는 멈춘 시간을 흐리게 표시 */
+    .time-display.paused {
+      color: #999;
     }
 
     .controls {
@@ -65,20 +118,70 @@
       gap: 8px;
     }
 
-    /* 두 개의 선택 항목을 한 줄에 배치. 한쪽이 숨겨지면 남은 쪽이 전체 폭을 차지 */
+    /* 버튼 줄 (일시정지 + 중지) */
     .row {
       display: flex;
       gap: 8px;
     }
 
-    .row > .format-selector {
+    /* 영상(왼쪽) / 오디오(오른쪽) 설정 두 열 */
+    .columns {
+      display: flex;
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .settings-column {
+      flex: 1 1 0;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 7px 10px 9px;
+      border: 1px solid #e8e8e8;
+      border-radius: 8px;
+      background: #fafafa;
+      transition: background 0.15s;
+    }
+
+    .column-title {
+      font-size: 12px;
+      line-height: 16px;
+      font-weight: 600;
+      color: #444;
+      letter-spacing: 0.5px;
+    }
+
+    /* 이번 모드에서 쓰지 않는 열/항목은 회색으로 흐리게 (선택 상자는 disabled) */
+    .settings-column.disabled {
+      background: #f0f0f0;
+      border-style: dashed;
+    }
+
+    .settings-column.disabled .column-title,
+    .settings-column.disabled label,
+    .format-selector.disabled label {
+      color: #b0b0b0;
+    }
+
+    .column-note {
+      font-size: 11px;
+      line-height: 14px;
+      color: #999;
+      word-break: keep-all;
+    }
+
+    /* 녹화 중에는 일시정지/재개 버튼과 중지 버튼을 한 줄에 나란히 (대기 중에는 시작 버튼만 전체 폭) */
+    .button-row > button {
       flex: 1 1 0;
       min-width: 0;
     }
 
     button {
-      padding: 11px;
+      padding: 10px;
       font-size: 15px;
+      line-height: 20px;
+      font-family: inherit;
       font-weight: 500;
       border: none;
       border-radius: 8px;
@@ -129,12 +232,35 @@
       cursor: not-allowed;
     }
 
+    #pauseButton {
+      background: #FB8C00;
+      color: white;
+    }
+
+    #pauseButton:hover {
+      background: #EF6C00;
+    }
+
+    /* 일시정지 상태: 재개 버튼 */
+    #pauseButton.paused {
+      background: #4CAF50;
+    }
+
+    #pauseButton.paused:hover {
+      background: #45a049;
+    }
+
+    #pauseButton:disabled {
+      background: #cccccc;
+      cursor: not-allowed;
+    }
+
     .message {
       margin-top: 8px;
-      padding: 8px 10px;
+      padding: 6px 10px;
       border-radius: 6px;
       font-size: 12px;
-      line-height: 1.35;
+      line-height: 15px;
       word-break: keep-all;
       overflow-wrap: anywhere;
       text-align: center;
@@ -191,9 +317,10 @@
     }
 
     .footer {
-      margin-top: 8px;
+      margin-top: 6px;
       text-align: center;
       font-size: 10px;
+      line-height: 13px;
       color: #aaa;
     }
 
@@ -205,13 +332,16 @@
 
     .format-selector label {
       font-size: 12px;
+      line-height: 15px;
       font-weight: 500;
       color: #666;
     }
 
     .format-selector select {
       width: 100%;
-      padding: 6px 8px;
+      height: 30px;
+      padding: 0 8px;
+      font-family: inherit;
       font-size: 13px;
       border: 1px solid #ddd;
       border-radius: 6px;
@@ -243,8 +373,9 @@
 
     .hint {
       font-size: 10px;
+      line-height: 14px;
       color: #888;
-      line-height: 1.3;
+      word-break: keep-all;
     }
   </style>
 </head>
@@ -258,7 +389,10 @@
   <div id="mainContainer" class="container loading-hidden">
     <div class="header">
       <h1>Recorda</h1>
-      <div id="status" class="status">대기 중</div>
+      <div class="header-right">
+        <div id="status" class="status">대기 중</div>
+        <button id="settingsButton" class="icon-button" type="button" title="설정 (저장 폴더)" aria-label="설정 열기">⚙</button>
+      </div>
     </div>
 
     <div id="timeDisplay" class="time-display">00:00</div>
@@ -273,48 +407,59 @@
         </select>
       </div>
 
-      <div class="row">
-        <div id="videoFormatGroup" class="format-selector hidden">
-          <label for="videoFormatSelect">영상 포맷</label>
-          <select id="videoFormatSelect" title="영상 파일의 오디오는 선택한 비트레이트의 MP3로 저장됩니다">
-            <option value="mp4" selected>MP4</option>
-            <option value="mov">MOV</option>
-            <option value="avi">AVI</option>
-          </select>
-        </div>
+      <div class="columns">
+        <!-- 왼쪽: 영상 설정 (오디오만 녹음 모드에서는 비활성) -->
+        <section id="videoColumn" class="settings-column" aria-labelledby="videoColumnTitle">
+          <h2 id="videoColumnTitle" class="column-title">영상</h2>
+          <div id="videoFormatGroup" class="format-selector">
+            <label for="videoFormatSelect">영상 포맷</label>
+            <select id="videoFormatSelect" title="영상 파일의 오디오는 선택한 비트레이트의 MP3로 저장됩니다. fMP4(조각 MP4)는 녹화 중 약 2초마다 조각을 기록해 종료가 빠르고, 브라우저가 비정상 종료돼도 기록된 조각까지 남습니다 (.mp4로 저장).">
+              <option value="mp4" selected>MP4</option>
+              <option value="fmp4">fMP4 (조각)</option>
+              <option value="mov">MOV</option>
+              <option value="avi">AVI</option>
+            </select>
+          </div>
+          <div id="videoColumnNote" class="column-note hidden">영상 녹화 안 함</div>
+          <div id="videoHint" class="hint hidden">영상은 H.264, 영상 파일 속 오디오는 오른쪽 비트레이트의 MP3로 저장됩니다. fMP4: 빠른 종료, 녹화 중 생성된 조각까지 보존.</div>
+        </section>
 
-        <div id="audioFormatGroup" class="format-selector">
-          <label for="formatSelect">오디오 포맷</label>
-          <select id="formatSelect">
-            <option value="wav" selected>WAV (무손실)</option>
-            <option value="mp3">MP3 (압축)</option>
-          </select>
-        </div>
+        <!-- 오른쪽: 오디오 설정 (영상+오디오 파일 1개 모드에서는 오디오 포맷만 비활성) -->
+        <section id="audioColumn" class="settings-column" aria-labelledby="audioColumnTitle">
+          <h2 id="audioColumnTitle" class="column-title">오디오</h2>
+          <div id="audioFormatGroup" class="format-selector">
+            <label for="formatSelect">오디오 포맷</label>
+            <select id="formatSelect">
+              <option value="wav" selected>WAV (무손실)</option>
+              <option value="mp3">MP3 (압축)</option>
+            </select>
+            <div id="audioFormatNote" class="column-note hidden">영상 파일에 포함</div>
+          </div>
+
+          <div class="format-selector">
+            <label for="bitrateSelect">MP3 비트레이트</label>
+            <select id="bitrateSelect">
+              <option value="128" selected>128 kbps</option>
+              <option value="192">192 kbps</option>
+              <option value="256">256 kbps</option>
+              <option value="320">320 kbps</option>
+            </select>
+          </div>
+
+          <div class="format-selector">
+            <label for="sampleRateSelect">샘플레이트</label>
+            <select id="sampleRateSelect">
+              <option value="44100" selected>44.1 kHz (CD)</option>
+              <option value="48000">48 kHz</option>
+            </select>
+          </div>
+        </section>
       </div>
 
-      <div class="row">
-        <div class="format-selector">
-          <label for="bitrateSelect">MP3 비트레이트</label>
-          <select id="bitrateSelect">
-            <option value="128" selected>128 kbps</option>
-            <option value="192">192 kbps</option>
-            <option value="256">256 kbps</option>
-            <option value="320">320 kbps</option>
-          </select>
-        </div>
-
-        <div class="format-selector">
-          <label for="sampleRateSelect">샘플레이트</label>
-          <select id="sampleRateSelect">
-            <option value="44100" selected>44.1 kHz (CD)</option>
-            <option value="48000">48 kHz</option>
-          </select>
-        </div>
+      <div class="row button-row">
+        <button id="pauseButton" class="hidden" type="button">일시정지</button>
+        <button id="recordButton">녹화 시작</button>
       </div>
-
-      <div id="videoHint" class="hint hidden">영상은 H.264, 영상 파일의 오디오는 선택한 비트레이트의 MP3로 저장됩니다.</div>
-
-      <button id="recordButton">녹화 시작</button>
     </div>
 
     <div id="message" class="message"></div>

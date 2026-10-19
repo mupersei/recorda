@@ -99,7 +99,7 @@ export function ffmpegDecodeErrors(path) {
 }
 
 /** MP4 박스 트리 파서 (테스트용) */
-const CONTAINER_BOXES = new Set(['moov', 'trak', 'mdia', 'minf', 'stbl', 'dinf', 'edts', 'udta']);
+const CONTAINER_BOXES = new Set(['moov', 'trak', 'mdia', 'minf', 'stbl', 'dinf', 'edts', 'udta', 'mvex', 'moof', 'traf']);
 export function parseBoxes(bytes, start = 0, end = bytes.length) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const boxes = [];
@@ -171,6 +171,98 @@ export function readStts(stblChildren) {
     entries.push({ count: view.getUint32(8 + i * 8), delta: view.getUint32(12 + i * 8) });
   }
   return entries;
+}
+
+/** stss(키프레임 샘플 번호, 1부터) 읽기. 상자가 없으면(모두 키프레임) null */
+export function readStss(stblChildren) {
+  const box = stblChildren.find(b => b.type === 'stss');
+  if (!box) return null;
+  const view = new DataView(box.payload.buffer, box.payload.byteOffset, box.payload.byteLength);
+  const count = view.getUint32(4);
+  const out = [];
+  for (let i = 0; i < count; i++) out.push(view.getUint32(8 + i * 4));
+  return out;
+}
+
+/** trak의 elst 항목 [{ segmentDuration, mediaTime, rate }] (없으면 []) */
+export function readElst(trakChildren) {
+  const elst = findBox(trakChildren, 'edts/elst');
+  if (!elst) return [];
+  const view = new DataView(elst.payload.buffer, elst.payload.byteOffset, elst.payload.byteLength);
+  const version = elst.payload[0];
+  const count = view.getUint32(4);
+  const out = [];
+  let o = 8;
+  for (let i = 0; i < count; i++) {
+    if (version === 1) {
+      out.push({ segmentDuration: Number(view.getBigUint64(o)), mediaTime: Number(view.getBigInt64(o + 8)), rate: view.getUint32(o + 16) });
+      o += 20;
+    } else {
+      out.push({ segmentDuration: view.getUint32(o), mediaTime: view.getInt32(o + 4), rate: view.getUint32(o + 8) });
+      o += 12;
+    }
+  }
+  return out;
+}
+
+/** 길이 필드 읽기: mvhd / tkhd / mdhd (버전 0) → { timescale?, duration } */
+export function readDuration(box) {
+  const view = new DataView(box.payload.buffer, box.payload.byteOffset, box.payload.byteLength);
+  if (box.type === 'mvhd' || box.type === 'mdhd') return { timescale: view.getUint32(12), duration: view.getUint32(16) };
+  if (box.type === 'tkhd') return { duration: view.getUint32(20) };
+  throw new Error(`길이를 읽을 수 없는 상자: ${box.type}`);
+}
+
+/**
+ * 조각 MP4(moof+mdat) 해석: 최상위 moof마다 { offset, size, sequence, tracks: { [trackId]: { baseTime, samples:[{duration,size,flags}], dataOffset } } }
+ * 와 그 뒤 mdat 범위. 샘플 데이터 위치는 tfhd default-base-is-moof 기준(moof 시작 + data_offset)
+ */
+export function readFragments(bytes) {
+  const top = parseBoxes(bytes);
+  const out = [];
+  for (let k = 0; k < top.length; k++) {
+    const moof = top[k];
+    if (moof.type !== 'moof') continue;
+    const mfhd = moof.children.find(b => b.type === 'mfhd');
+    const sequence = new DataView(mfhd.payload.buffer, mfhd.payload.byteOffset, mfhd.payload.byteLength).getUint32(4);
+    const tracks = {};
+    for (const traf of moof.children.filter(b => b.type === 'traf')) {
+      const tfhd = traf.children.find(b => b.type === 'tfhd');
+      const hv = new DataView(tfhd.payload.buffer, tfhd.payload.byteOffset, tfhd.payload.byteLength);
+      const tfhdFlags = hv.getUint32(0) & 0xFFFFFF;
+      const trackId = hv.getUint32(4);
+      let ho = 8;
+      if (tfhdFlags & 0x1) ho += 8;
+      if (tfhdFlags & 0x2) ho += 4;
+      const defaultDuration = tfhdFlags & 0x8 ? hv.getUint32(ho) : null; if (tfhdFlags & 0x8) ho += 4;
+      const defaultSize = tfhdFlags & 0x10 ? hv.getUint32(ho) : null; if (tfhdFlags & 0x10) ho += 4;
+      const defaultFlags = tfhdFlags & 0x20 ? hv.getUint32(ho) : null;
+      const tfdt = traf.children.find(b => b.type === 'tfdt');
+      const dv = new DataView(tfdt.payload.buffer, tfdt.payload.byteOffset, tfdt.payload.byteLength);
+      const baseTime = tfdt.payload[0] === 1 ? Number(dv.getBigUint64(4)) : dv.getUint32(4);
+      const trun = traf.children.find(b => b.type === 'trun');
+      const tv = new DataView(trun.payload.buffer, trun.payload.byteOffset, trun.payload.byteLength);
+      const trunFlags = tv.getUint32(0) & 0xFFFFFF;
+      const count = tv.getUint32(4);
+      let o = 8;
+      let dataOffset = null, firstFlags = null;
+      if (trunFlags & 0x1) { dataOffset = tv.getInt32(o); o += 4; }
+      if (trunFlags & 0x4) { firstFlags = tv.getUint32(o); o += 4; }
+      const samples = [];
+      for (let i = 0; i < count; i++) {
+        const s = { duration: defaultDuration, size: defaultSize, flags: i === 0 && firstFlags !== null ? firstFlags : defaultFlags };
+        if (trunFlags & 0x100) { s.duration = tv.getUint32(o); o += 4; }
+        if (trunFlags & 0x200) { s.size = tv.getUint32(o); o += 4; }
+        if (trunFlags & 0x400) { s.flags = tv.getUint32(o); o += 4; }
+        if (trunFlags & 0x800) { o += 4; }
+        samples.push(s);
+      }
+      tracks[trackId] = { baseTime, samples, dataOffset, tfhdFlags, trunFlags };
+    }
+    const mdat = top[k + 1] && top[k + 1].type === 'mdat' ? top[k + 1] : null;
+    out.push({ offset: moof.offset, size: moof.size, sequence, tracks, mdat: mdat ? { offset: mdat.offset, size: mdat.size, headerSize: mdat.headerSize } : null });
+  }
+  return out;
 }
 
 /** RIFF(AVI) 청크 트리 파서 (테스트용) */

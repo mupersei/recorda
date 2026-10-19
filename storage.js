@@ -65,6 +65,31 @@ export async function saveSetting(key, value) {
 }
 
 /**
+ * 여러 설정 값을 한 번에 저장합니다 (saveSetting과 같은 락으로 직렬화되는 Read-Modify-Write)
+ * @param {Object} patch - 바꿀 설정 키/값 (예: { saveLocationMode: 'folder', saveLocationName: 'Recordings' })
+ * @returns {Promise<boolean>} 저장 성공 여부
+ */
+export async function saveSettings(patch) {
+  saveSettingLock = saveSettingLock.then(async () => {
+    try {
+      const currentSettings = await loadSettings();
+      const next = { ...currentSettings, ...patch };
+      await chrome.storage.sync.set({
+        [STORAGE_KEYS.SETTINGS]: next
+      });
+
+      console.log('[Storage] 설정 저장 완료:', patch);
+      return true;
+    } catch (error) {
+      console.error('[Storage] 설정 저장 실패:', error);
+      return false;
+    }
+  });
+
+  return saveSettingLock;
+}
+
+/**
  * 모든 설정을 초기화합니다
  * @returns {Promise<boolean>} 초기화 성공 여부
  */

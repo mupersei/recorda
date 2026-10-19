@@ -8,6 +8,7 @@ class AudioRecorderProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.isRecording = false;
+    this.isPaused = false;
     this.chunkCounter = 0;
 
     // 배치 처리 (4096 샘플마다 전송 = ScriptProcessorNode와 동일)
@@ -22,12 +23,33 @@ class AudioRecorderProcessor extends AudioWorkletProcessor {
 
       if (command === 'start') {
         this.isRecording = true;
+        this.isPaused = false;
         this.leftBuffer = [];
         this.rightBuffer = [];
         this.currentSize = 0;
         console.log('[AudioWorklet] 녹음 시작');
+      } else if (command === 'pause') {
+        if (this.isRecording) {
+          // 일시정지 경계까지 모은 데이터를 바로 보내고 수집 중단 → 경계 정밀도가 배치(4096)가 아닌 렌더 퀀텀(128) 단위
+          // 메인 스레드는 'paused' 응답 전에 도착한 데이터까지 일시정지 이전 구간으로 기록
+          this.flushBuffer();
+          this.isRecording = false;
+          this.isPaused = true;
+          console.log('[AudioWorklet] 녹음 일시정지');
+        }
+        // 보낼 데이터가 없어도(중복 요청 등) 항상 응답해 메인 스레드가 타임아웃까지 기다리지 않게 함
+        this.port.postMessage({ type: 'paused' });
+      } else if (command === 'resume') {
+        if (!this.isPaused) return; // 중지 후에는 재개하지 않음
+        this.isPaused = false;
+        this.isRecording = true;
+        this.leftBuffer = [];
+        this.rightBuffer = [];
+        this.currentSize = 0;
+        console.log('[AudioWorklet] 녹음 재개');
       } else if (command === 'stop') {
         this.isRecording = false;
+        this.isPaused = false;
         // 남은 데이터 전송 후 완료 응답 (메인 스레드가 마지막 청크까지 받은 뒤 정리할 수 있도록)
         this.flushBuffer();
         this.port.postMessage({ type: 'stopped' });
@@ -44,7 +66,7 @@ class AudioRecorderProcessor extends AudioWorkletProcessor {
    * @returns {boolean} - true: 계속 실행, false: 종료
    */
   process(inputs, _outputs, _parameters) {
-    // 녹음 중이 아니면 그냥 통과
+    // 녹음 중이 아니면(시작 전 / 일시정지 / 중지) 그냥 통과
     if (!this.isRecording) {
       return true;
     }
