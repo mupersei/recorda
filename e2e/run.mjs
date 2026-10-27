@@ -13,6 +13,13 @@
 //                  띄울 수 없으므로 save-location.js로 OPFS 루트 핸들을 저장 폴더로 등록). folder-* 시나리오는 항상 폴더 저장
 //  crash-fmp4: --only로 지정할 때만 실행 (Chrome을 SIGKILL하므로 마지막에 실행되고 이후 시나리오는 건너뜀).
 //              fMP4 폴더 녹화 20초 뒤 브라우저 프로세스를 죽이고, 프로필의 File System에 남은 가장 큰 최근 파일(스왑/부분 파일)을 ffprobe로 확인
+//  VideoFrame 누수 검사(모든 시나리오): Chrome은 close() 없이 GC된 VideoFrame을 10초 주기 타이머로 모아 offscreen 페이지 콘솔에
+//              "A VideoFrame was garbage collected without being closed..."(Log.entryAdded, 인자 없는 메시지)로 알립니다. 하네스는
+//              --js-flags=--expose-gc로 Chrome을 띄워 녹화 중간에 한 번, 중지 직후에 gc()를 두 번 강제하고, 경고가 나올 때까지
+//              RECORDA_LEAK_SETTLE_MS(기본 11.5초) 기다린 뒤 경고 수를 videoFrameLeakWarnings로 보고·검사(0건)합니다.
+//              offscreen 페이지에는 VideoFrame 집계(frameTally: 리더에서 받은/close한 프레임, new VideoFrame으로 만든/close한 프레임,
+//              encode 호출, FinalizationRegistry로 잡은 "close 없이 GC된 프레임")도 주입합니다.
+//  leak-selftest: --only로만. 일부러 닫지 않은 VideoFrame을 만들어 위 검사가 경고·집계를 실제로 잡는지 확인
 import puppeteer from 'puppeteer';
 import { execFileSync, spawnSync, execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync, readFileSync, rmSync, openSync, writeSync, closeSync, readSync, copyFileSync } from 'node:fs';
@@ -42,6 +49,10 @@ let evictFast = false; // 중지 이후에는 대량 읽기/쓰기가 일어나�
 //                        → writeback이 따라잡으면 재개. 멈춘 시간은 report.json의 throttle*에 따로 기록 (e2e/pressure-throttle.mjs)
 const THROTTLE_MB = Number(process.env.RECORDA_THROTTLE_MB || 0);
 let throttle = null;
+//  RECORDA_LEAK_SETTLE_MS : 중지 후 gc() 강제부터 누수 경고를 셀 때까지 기다리는 시간. Chrome WebCodecs 로거가 10초 주기로 경고를 내므로 10초 이상
+const LEAK_SETTLE_MS = Number(process.env.RECORDA_LEAK_SETTLE_MS || 11_500);
+// Chrome WebCodecs 경고 (VideoFrame / AudioData 공통 문구 "garbage collected without being closed")
+const LEAK_WARNING = /VideoFrame was garbage collected without being closed|garbage collected without being closed/;
 
 // cgroup v2 메모리 사용량 (anon = 실제 프로세스 메모리, file = 페이지 캐시)
 function cgroupMemory() {
@@ -86,7 +97,27 @@ const SCENARIOS = [
   // 일시정지/재개 + fMP4: 조각의 tfdt가 일시정지 앞뒤로 끊김 없이 이어지는지
   { id: 'pause-fmp4', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'fmp4', expect: ['mp4'], duration: 12, pause: { at: 8, seconds: 4 } },
   // 비정상 종료: fMP4 폴더 녹화 중 Chrome SIGKILL → 남은 부분 파일 확인 (--only로만 실행, 헤드리스의 "폴더"는 프로필 안 OPFS 루트)
-  { id: 'crash-fmp4', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'fmp4', expect: ['mp4'], saveToFolder: true, duration: 20, crashAt: 20, explicitOnly: true }
+  { id: 'crash-fmp4', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'fmp4', expect: ['mp4'], saveToFolder: true, duration: 20, crashAt: 20, explicitOnly: true },
+  // ---- VideoFrame 누수 조사 (누수 검사는 모든 시나리오에서 하고, 아래는 누수 경로를 직접 겨냥) ----
+  // 15초 녹화 → 중지 → gc()
+  { id: 'leak-probe', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: ['mp4'], duration: 15 },
+  // 시작 직후(녹화 중 표시가 뜨자마자) 중지: 첫 프레임 도착·인코딩과 reader.cancel()의 경합 (녹화 1초 미만)
+  { id: 'quick-stop-mp4', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: ['mp4'], duration: 0, quickStop: true },
+  // 탭 닫힘 흉내: 6초 뒤 가짜 소스의 트랙을 멈추고 ended 이벤트 → 확장이 중지 클릭 없이 스스로 마무리 (프레임이 오가는 중 트랙 종료)
+  { id: 'tab-ended-mp4', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: ['mp4'], duration: 6, endTrack: true },
+  // 세션 시작 뒤 시작 실패: offscreen의 RECORDING_STARTED 전송을 1.5초 뒤 실패시킴 → 프레임을 읽던 영상 세션을 정리해야 함
+  { id: 'start-fail-mp4', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: [], startFails: { failStartedMessageAfterMs: 1500 }, expectError: /RECORDING_STARTED 전송 실패/ },
+  // 영상 트랙 없음(NO_VIDEO): 가짜 getUserMedia가 오디오 트랙만 돌려줌 → 시작 오류
+  { id: 'no-video-mp4', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: [], startFails: { noVideo: true }, expectError: /탭 영상/ },
+  // 녹화 중 인코더 오류: 45번째 encode() 직전에 인코더를 닫아 encode()가 동기 예외를 던지게 함 → 중지 시 영상 인코딩 실패 오류
+  { id: 'encoder-error-mp4', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: [], duration: 4, encoderFailAfter: 45, expectError: /영상 인코딩에 실패/ },
+  // 중지 경합 스트레스: offscreen 페이지에서 실제 VideoTrackEncoder(video-recorder.js)를 가짜 소스 트랙의 복제본으로 40회 시작→중지.
+  // 대기 중 read가 있는 채로 리더를 cancel하면 Chrome이 그 read에 주려고 만든 프레임이 close 없이 버려짐 (중지 1회로는 드러나지 않는 경합)
+  { id: 'stop-race-stress', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: [], stress: { cycles: 40 } },
+  // 실제 흐름 반복: 같은 offscreen 문서에서 팝업으로 짧은 녹화(0.6~1.6초) 20회 시작→중지 (Background·Offscreen 정리 순서까지 포함)
+  { id: 'record-cycles-mp4', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: [], cycles: { count: 20, minMs: 600, maxMs: 1600 } },
+  // 누수 검사 자체 확인 (--only로만): 일부러 close하지 않은 VideoFrame → 경고와 집계(leakedCreated)가 잡혀야 함
+  { id: 'leak-selftest', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: [], selfTest: true, explicitOnly: true }
 ].filter(s => (!ONLY || ONLY.includes(s.id)) && (!s.explicitOnly || (ONLY && ONLY.includes(s.id))))
   // Chrome을 죽이는 시나리오는 맨 뒤로
   .sort((a, b) => (a.crashAt ? 1 : 0) - (b.crashAt ? 1 : 0));
@@ -107,7 +138,13 @@ function fakeMediaScript(width, height, resize = null) {
       window.__e2e = { frames: 0 };
       navigator.mediaDevices.getUserMedia = async (constraints) => {
         window.__e2e.constraints = JSON.parse(JSON.stringify(constraints));
+        // 같은 문서에서 다시 캡처하면(record-cycles) 이전 가짜 소스(그리기 타이머·캔버스·AudioContext)를 먼저 정리
+        if (window.__e2e.timer) { clearInterval(window.__e2e.timer); window.__e2e.timer = null; }
+        if (window.__e2e.canvas) { window.__e2e.canvas.remove(); window.__e2e.canvas = null; }
+        if (window.__e2e.audioCtx && window.__e2e.audioCtx.state !== 'closed') window.__e2e.audioCtx.close().catch(() => {});
+        window.__e2e.captures = (window.__e2e.captures || 0) + 1;
         const stream = new MediaStream();
+        window.__e2e.stream = stream; // 탭 닫힘 흉내(트랙 종료)용
         const ctx = new AudioContext({ sampleRate: 48000 });
         await ctx.resume();
         const osc = ctx.createOscillator();
@@ -126,10 +163,12 @@ function fakeMediaScript(width, height, resize = null) {
         stream.addTrack(dest.stream.getAudioTracks()[0]);
         window.__e2e.audioCtx = ctx;
 
-        if (constraints.video) {
+        // no-video-mp4: 영상 모드인데 영상 트랙 없이 돌려줌 (NO_VIDEO 시작 오류)
+        if (constraints.video && !window.__e2eNoVideo) {
           const canvas = document.createElement('canvas');
           canvas.width = W; canvas.height = H;
           document.body.appendChild(canvas);
+          window.__e2e.canvas = canvas;
           const g = canvas.getContext('2d');
           const start = performance.now();
           let resized = false;
@@ -180,6 +219,11 @@ function offscreenMessageSpyScript() {
               : action === 'DOWNLOAD_FILE' ? { filename: message.data && message.data.filename } : null;
             window.__e2eSent.push({ action, at: Date.now(), data });
           } catch { /* 기록 실패는 무시 */ }
+          // start-fail-mp4: 영상 세션이 프레임을 읽기 시작한 뒤의 시작 실패를 만들기 위해 RECORDING_STARTED 전송을 늦게 실패시킴
+          const inject = window.__e2eFailStartedMessage;
+          if (inject && message && message.action === 'RECORDING_STARTED') {
+            return new Promise((_, reject) => setTimeout(() => reject(new Error('e2e 주입: RECORDING_STARTED 전송 실패')), inject.afterMs || 0));
+          }
           return original(message, ...rest);
         };
         try { runtime.sendMessage = spy; } catch { /* 아래에서 재정의 */ }
@@ -190,6 +234,120 @@ function offscreenMessageSpyScript() {
       }
     })();
   `;
+}
+
+// ---- VideoFrame 수명 집계 (offscreen 페이지에 모든 스크립트보다 먼저 주입) ----
+// 리더(MediaStreamTrackProcessor)에서 받은 프레임과 new VideoFrame으로 만든 프레임(정규화)을 FinalizationRegistry에 등록하고
+// close()를 감싸 닫힘을 기록 → close 없이 GC된 프레임 수(leakedRead / leakedCreated)를 Chrome 경고(10초 주기, 건수 뭉침)와 별개로 정확히 셈.
+// encode() 호출 수도 셈. window.__e2eEncoderFailAfter = N이면 N번째 encode 직전에 인코더를 닫아 encode가 동기 예외를 던지게 함 (오류 주입)
+function frameTallyScript() {
+  return `
+    (() => {
+      const tally = { installed: false, error: null, read: 0, readClosed: 0, created: 0, createdClosed: 0, encodeCalls: 0, encodeThrows: 0, leakedRead: 0, leakedCreated: 0, injectedEncoderClose: false };
+      window.__e2eFrameTally = tally;
+      try {
+        const tokens = new WeakMap();
+        const registry = new FinalizationRegistry((token) => {
+          if (!token.closed) tally[token.kind === 'read' ? 'leakedRead' : 'leakedCreated']++;
+        });
+        const trackFrame = (frame, kind) => {
+          if (!frame || typeof frame !== 'object' || tokens.has(frame)) return;
+          const token = { kind, closed: false };
+          tokens.set(frame, token);
+          registry.register(frame, token);
+          tally[kind]++;
+        };
+        const NativeVideoFrame = window.VideoFrame;
+        const nativeClose = NativeVideoFrame.prototype.close;
+        NativeVideoFrame.prototype.close = function () {
+          const token = tokens.get(this);
+          if (token && !token.closed) { token.closed = true; tally[token.kind + 'Closed']++; }
+          return nativeClose.call(this);
+        };
+        class TrackedVideoFrame extends NativeVideoFrame {
+          constructor(...args) { super(...args); trackFrame(this, 'created'); }
+        }
+        window.VideoFrame = TrackedVideoFrame;
+        const NativeProcessor = window.MediaStreamTrackProcessor;
+        if (NativeProcessor) {
+          window.MediaStreamTrackProcessor = function (init) {
+            const processor = new NativeProcessor(init);
+            const readable = processor.readable;
+            const nativeGetReader = readable.getReader;
+            readable.getReader = function (...args) {
+              const reader = nativeGetReader.apply(this, args);
+              const nativeRead = reader.read;
+              reader.read = function (...readArgs) {
+                return nativeRead.apply(this, readArgs).then((result) => { if (result && result.value) trackFrame(result.value, 'read'); return result; });
+              };
+              return reader;
+            };
+            return processor;
+          };
+        }
+        const NativeEncoder = window.VideoEncoder;
+        if (NativeEncoder) {
+          const nativeEncode = NativeEncoder.prototype.encode;
+          NativeEncoder.prototype.encode = function (...args) {
+            tally.encodeCalls++;
+            if (window.__e2eEncoderFailAfter && tally.encodeCalls === window.__e2eEncoderFailAfter) {
+              try { this.close(); tally.injectedEncoderClose = true; } catch { /* 이미 닫힘 */ }
+            }
+            try { return nativeEncode.apply(this, args); } catch (error) { tally.encodeThrows++; throw error; }
+          };
+        }
+        tally.installed = true;
+      } catch (error) {
+        tally.error = String(error);
+      }
+    })();
+  `;
+}
+
+// offscreen 페이지 GC 강제: gc()(--js-flags=--expose-gc) 두 번, 사이에 잠시 대기 (지연 해제·FinalizationRegistry 콜백이 돌도록).
+// gc가 노출되지 않았으면 CDP HeapProfiler.collectGarbage로 대신함
+async function forceGc(page) {
+  const viaGc = await page.evaluate(async () => {
+    if (typeof gc !== 'function') return false;
+    gc();
+    await new Promise(r => setTimeout(r, 300));
+    gc();
+    await new Promise(r => setTimeout(r, 50));
+    return true;
+  }).catch(() => false);
+  if (viaGc) return 'gc()';
+  try {
+    const session = await page.createCDPSession();
+    await session.send('HeapProfiler.collectGarbage');
+    await sleep(300);
+    await session.send('HeapProfiler.collectGarbage');
+    await session.detach();
+    return 'HeapProfiler.collectGarbage';
+  } catch { return null; }
+}
+
+// 중지 후 강제 GC로부터 LEAK_SETTLE_MS가 지날 때까지 기다린 뒤 누수 경고 수와 프레임 집계를 결과에 기록하고 검사
+async function settleFrameLeaks({ offPage, offLogs, result, gcAt, expectLeak = false, label = '' }) {
+  const waitMs = gcAt ? LEAK_SETTLE_MS - (Date.now() - gcAt) : LEAK_SETTLE_MS;
+  if (waitMs > 0) await sleep(waitMs);
+  const tally = await offPage.evaluate(() => (window.__e2eFrameTally ? { ...window.__e2eFrameTally } : null)).catch(() => null);
+  const warnings = offLogs.filter(l => LEAK_WARNING.test(l));
+  result.videoFrameLeakWarnings = warnings.length;
+  result.frameTally = tally;
+  result.leakSettleMs = gcAt ? Date.now() - gcAt : null;
+  const leaked = tally ? tally.leakedRead + tally.leakedCreated : null;
+  const tallyText = tally
+    ? `리더 프레임 ${tally.read}개 중 close ${tally.readClosed}, new VideoFrame ${tally.created}개 중 close ${tally.createdClosed}, encode ${tally.encodeCalls}회${tally.encodeThrows ? `(예외 ${tally.encodeThrows})` : ''}, close 없이 GC ${leaked}개`
+    : '집계 없음';
+  log(`  VideoFrame 누수 검사: Chrome 경고 ${warnings.length}건 (중지 후 GC ${result.gc && result.gc.afterStop ? result.gc.afterStop : '-'} → ${result.leakSettleMs} ms 대기) | ${tallyText}`);
+  if (expectLeak) {
+    result.checks.push({ name: `누수 검사 자체 확인: 일부러 닫지 않은 프레임 → Chrome 경고 ${warnings.length}건, close 없이 GC ${leaked}개`, pass: warnings.length >= 1 && leaked >= 1 });
+    return;
+  }
+  result.checks.push({ name: `${label}VideoFrame 누수 경고(close 없이 GC) ${warnings.length}건 (중지 후 gc() 강제 + ${Math.round((result.leakSettleMs || 0) / 1000)}초 대기)`, pass: warnings.length === 0, detail: warnings.slice(0, 2).join(' / ') });
+  if (tally && tally.installed) {
+    result.checks.push({ name: `${label}VideoFrame 집계: ${tallyText}`, pass: leaked === 0 && tally.read === tally.readClosed && tally.created === tally.createdClosed });
+  }
 }
 
 // ---- 사용자 폴더 저장 (OPFS 루트를 저장 폴더로) ----
@@ -657,7 +815,9 @@ async function main() {
       '--autoplay-policy=no-user-gesture-required',
       '--use-fake-ui-for-media-stream',
       '--disable-features=DialMediaRouteProvider',
-      '--window-size=1400,900'
+      '--window-size=1400,900',
+      // VideoFrame 누수 검사: offscreen 페이지에서 gc()를 강제해 close 없이 버려진 프레임의 Chrome 경고를 시나리오 안에서 드러냄
+      '--js-flags=--expose-gc'
     ]
   });
   const browserPid = browser.process().pid;
@@ -776,18 +936,21 @@ async function main() {
   // crash-fmp4: 브라우저를 죽인 뒤에는 시나리오를 더 진행하지 않음
   let crashed = false;
   class CrashDone extends Error {}
+  // 시작 실패·누수 검사 자체 확인처럼 녹화·파일 검증 단계가 없는 시나리오는 검사를 마친 뒤 이 예외로 나머지 단계를 건너뜀
+  class ScenarioDone extends Error {}
   const sampler = new ResourceSampler(browserPid);
 
   // 유휴 기준값: 페이지만 열어둔 상태
   const offPage = await browser.newPage();
   await offPage.evaluateOnNewDocument(offscreenMessageSpyScript());
+  await offPage.evaluateOnNewDocument(frameTallyScript());
   const popPage = await browser.newPage();
   await sleep(1500);
   const baseline = sampler.sample();
   log(`유휴 PSS ${(baseline.totalRss / 1048576).toFixed(0)} MB, 프로세스 ${baseline.procCount}개`);
 
   for (const sc of SCENARIOS) {
-    const duration = sc.duration || DURATION;
+    const duration = sc.duration ?? DURATION; // quick-stop은 0 (바로 중지)
     const width = Number(args.width) || sc.width || 1280, height = Number(args.height) || sc.height || 720;
     const saveToFolder = !!(sc.saveToFolder || args.saveToFolder);
     log(`===== ${sc.id} (${sc.mode}, audio=${sc.audio}, video=${sc.video}, ${width}x${height}, ${duration}s, 저장: ${saveToFolder ? '폴더(OPFS 루트) 직접 기록' : '다운로드'}) =====`);
@@ -802,7 +965,10 @@ async function main() {
       // offscreen 페이지 (가짜 getUserMedia 주입 후 로드)
       await offPage.removeAllListeners('console');
       offPage.on('console', m => {
-        Promise.all(m.args().map(a => a.jsonValue().catch(() => '?')))
+        const consoleArgs = m.args();
+        // Blink가 직접 남기는 메시지(Log.entryAdded: WebCodecs "VideoFrame was garbage collected ..." 경고 등)는 인자 없이 text만 옴
+        if (!consoleArgs.length) { offLogs.push(m.text()); return; }
+        Promise.all(consoleArgs.map(a => a.jsonValue().catch(() => '?')))
           .then(vals => offLogs.push(vals.map(v => (typeof v === 'object' ? JSON.stringify(v) : String(v))).join(' ')))
           .catch(() => offLogs.push(m.text()));
       });
@@ -811,6 +977,67 @@ async function main() {
       await offPage.goto(`chrome-extension://${extensionId}/offscreen.html`, { waitUntil: 'load' });
       const spyInstalled = await offPage.evaluate(() => window.__e2eSpyInstalled === true);
       if (!spyInstalled) log('  ⚠ offscreen 메시지 기록 설치 실패:', await offPage.evaluate(() => window.__e2eSpyError || '?'));
+      const tallyState = await offPage.evaluate(() => window.__e2eFrameTally && { installed: window.__e2eFrameTally.installed, error: window.__e2eFrameTally.error }).catch(() => null);
+      if (!tallyState || !tallyState.installed) log('  ⚠ VideoFrame 집계 설치 실패:', JSON.stringify(tallyState));
+
+      if (sc.selfTest) {
+        // 누수 검사 자체 확인: 이 페이지에서 일부러 close하지 않은 VideoFrame을 만들어 버림 → gc() → Chrome 경고와 집계가 잡혀야 함
+        const made = await offPage.evaluate(() => {
+          const canvas = new OffscreenCanvas(64, 64);
+          canvas.getContext('2d').fillRect(0, 0, 64, 64);
+          let frame = new VideoFrame(canvas, { timestamp: 0 });
+          const ok = frame.codedWidth === 64;
+          frame = null;
+          return ok;
+        });
+        result.gc = { afterStop: await forceGc(offPage) };
+        const gcAt = Date.now();
+        result.checks.push({ name: `닫지 않은 VideoFrame 생성 ${made}, GC 강제 ${result.gc.afterStop}`, pass: !!made && !!result.gc.afterStop });
+        await settleFrameLeaks({ offPage, offLogs, result, gcAt, expectLeak: true });
+        result.ok = result.checks.every(c => c.pass);
+        throw new ScenarioDone();
+      }
+
+      if (sc.stress) {
+        // ---- 중지 경합 스트레스: 실제 VideoTrackEncoder를 가짜 소스(캔버스 30fps) 트랙 복제본으로 반복 시작→중지 ----
+        const tStress = Date.now();
+        const out = await offPage.evaluate(async ({ cycles }) => {
+          const { VideoTrackEncoder } = await import('./video-recorder.js');
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { mandatory: {} } });
+          const base = stream.getVideoTracks()[0];
+          const sink = { setVideoConfig() {}, addVideoSample() { return true; } };
+          const totals = { cycles, frames: 0, samples: 0, errors: [], stopMsMax: 0, stopMsSum: 0, framesRead: 0, framesClosed: 0, framesAfterStop: 0, cancelledWithPendingRead: 0, hasStats: false };
+          for (let i = 0; i < cycles; i++) {
+            const track = base.clone();
+            const encoder = new VideoTrackEncoder({ track, sampleSink: sink });
+            await encoder.start();
+            await new Promise(r => setTimeout(r, 60 + (i * 37) % 140)); // 중지 시점을 프레임 간격에 대해 고르게 흩뜨림
+            const t = performance.now();
+            try { await encoder.stop(); } catch (error) { totals.errors.push(String(error && error.message)); }
+            const ms = performance.now() - t;
+            totals.stopMsSum += ms; totals.stopMsMax = Math.max(totals.stopMsMax, ms);
+            track.stop();
+            totals.frames += encoder.frameCount; totals.samples += encoder.sampleCount;
+            if (encoder.stats) {
+              totals.hasStats = true;
+              totals.framesRead += encoder.stats.framesRead; totals.framesClosed += encoder.stats.framesClosed;
+              totals.framesAfterStop += encoder.stats.framesAfterStop || 0;
+              if (encoder.stats.cancelledWithPendingRead) totals.cancelledWithPendingRead++;
+            }
+          }
+          for (const t of stream.getTracks()) t.stop();
+          return totals;
+        }, { cycles: sc.stress.cycles });
+        result.stress = { ...out, avgStopMs: +(out.stopMsSum / out.cycles).toFixed(1), stopMsMax: +out.stopMsMax.toFixed(1), totalMs: Date.now() - tStress };
+        log(`  중지 경합 스트레스: ${out.cycles}회 시작→중지, 인코딩 ${out.frames}프레임, 중지 평균 ${result.stress.avgStopMs} ms (최대 ${result.stress.stopMsMax}), 오류 ${out.errors.length}` +
+          (out.hasStats ? ` | 확장 집계 read ${out.framesRead} → close ${out.framesClosed} (중지 뒤 받은 프레임 ${out.framesAfterStop}), 대기 read가 남은 채 cancel ${out.cancelledWithPendingRead}회` : ' | 확장 집계 없음(변경 전 코드)'));
+        result.checks.push({ name: `중지 경합 스트레스: ${out.cycles}회 시작→중지 오류 ${out.errors.length}건, 인코딩 ${out.frames}프레임`, pass: out.errors.length === 0 && out.frames > out.cycles });
+        if (out.hasStats) result.checks.push({ name: `중지 경합 스트레스: 확장 집계 framesRead ${out.framesRead} = framesClosed ${out.framesClosed}`, pass: out.framesRead === out.framesClosed });
+        result.gc = { afterStop: await forceGc(offPage) };
+        await settleFrameLeaks({ offPage, offLogs, result, gcAt: Date.now() });
+        result.ok = result.checks.every(c => c.pass);
+        throw new ScenarioDone();
+      }
 
       // 저장 위치: 폴더 시나리오면 OPFS 루트를 저장 폴더로 등록, 아니면 기본(다운로드)으로
       const saveInfo = await configureSaveFolder(offPage, saveToFolder);
@@ -847,20 +1074,137 @@ async function main() {
       });
       result.checks.push({ name: `저장 위치 미러(storage.sync) ${mirror.saveLocationMode || 'downloads'}${mirror.saveLocationName ? ` (${mirror.saveLocationName})` : ''}, 팝업에는 저장 위치 ${ui.saveLocationShown ? '표시됨' : '미표시'}`, pass: (mirror.saveLocationMode || 'downloads') === (saveToFolder ? 'folder' : 'downloads') && !ui.saveLocationShown });
 
-      // 녹화 시작
+      if (sc.cycles) {
+        // ---- 실제 흐름 반복: 팝업으로 짧은 녹화를 여러 번 (같은 offscreen 문서, 매번 새 가짜 캡처) ----
+        const readUi = () => popPage.evaluate(() => {
+          const b = document.querySelector('#recordButton');
+          return { status: document.querySelector('#status').textContent.trim(), buttonText: b.textContent.trim(), buttonDisabled: b.disabled };
+        });
+        const endings = () => offPage.evaluate(() => (window.__e2eSent || []).filter(m => m.action === 'RECORDING_COMPLETE' || m.action === 'RECORDING_ERROR').map(m => m.action));
+        const runs = [];
+        let seed = 7;
+        for (let i = 0; i < sc.cycles.count; i++) {
+          const endedBefore = (await endings()).length;
+          await popPage.waitForFunction(() => { const b = document.querySelector('#recordButton'); return !b.disabled && b.textContent.trim() === '녹화 시작'; }, { timeout: 30_000 });
+          await popPage.click('#recordButton');
+          await popPage.waitForFunction(() => /녹화 중|녹음 중/.test(document.querySelector('#status').textContent), { timeout: 20_000 });
+          seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+          const holdMs = sc.cycles.minMs + (seed % (sc.cycles.maxMs - sc.cycles.minMs));
+          await sleep(holdMs);
+          const tStopCycle = Date.now();
+          await popPage.click('#recordButton');
+          const deadline = Date.now() + 60_000;
+          let ended = [];
+          while (Date.now() < deadline) {
+            ended = await endings();
+            if (ended.length > endedBefore) break;
+            await sleep(50);
+          }
+          const ui = await readUi();
+          runs.push({ holdMs, stopToEndMs: Date.now() - tStopCycle, ending: ended[ended.length - 1] || null, ui });
+        }
+        // 마지막 녹화의 다운로드·정리까지 끝나도록
+        await popPage.waitForFunction(() => { const b = document.querySelector('#recordButton'); return !b.disabled && b.textContent.trim() === '녹화 시작'; }, { timeout: 30_000 }).catch(() => {});
+        await sleep(500);
+        const completes = runs.filter(r => r.ending === 'RECORDING_COMPLETE').length;
+        const captures = await offPage.evaluate(() => window.__e2e.captures || 0);
+        result.cycles = { count: runs.length, completes, captures, runs };
+        const encoderLines = offLogs.filter(l => l.includes('[VideoTrackEncoder] 완료'));
+        const stats = encoderLines.map(l => { try { return JSON.parse(l.slice(l.indexOf('{'))); } catch { return null; } }).filter(Boolean);
+        const fs = stats.map(s => s.frameStats).filter(Boolean);
+        if (fs.length) {
+          result.cycles.frameStats = {
+            framesRead: fs.reduce((n, s) => n + s.framesRead, 0), framesClosed: fs.reduce((n, s) => n + s.framesClosed, 0),
+            framesAfterStop: fs.reduce((n, s) => n + (s.framesAfterStop || 0), 0), cancelledWithPendingRead: fs.filter(s => s.cancelledWithPendingRead).length
+          };
+        }
+        log(`  녹화 반복: ${runs.length}회 중 완료 ${completes}회 (캡처 ${captures}회), 녹화 ${runs.map(r => r.holdMs).join('/')} ms` + (result.cycles.frameStats ? ` | 확장 집계 ${JSON.stringify(result.cycles.frameStats)}` : ''));
+        result.checks.push({ name: `녹화 반복 ${runs.length}회: RECORDING_COMPLETE ${completes}회, 캡처 ${captures}회`, pass: completes === sc.cycles.count && captures === sc.cycles.count });
+        if (result.cycles.frameStats) result.checks.push({ name: `녹화 반복: 확장 집계 framesRead ${result.cycles.frameStats.framesRead} = framesClosed ${result.cycles.frameStats.framesClosed}`, pass: result.cycles.frameStats.framesRead === result.cycles.frameStats.framesClosed });
+        result.gc = { afterStop: await forceGc(offPage) };
+        await settleFrameLeaks({ offPage, offLogs, result, gcAt: Date.now() });
+        result.ok = result.checks.every(c => c.pass);
+        throw new ScenarioDone();
+      }
+
+      if (sc.startFails) {
+        // ---- 시작 실패: 오류를 주입하고 녹화 시작 → 팝업 오류 메시지, SW IDLE, 영상 세션 정리(쓰다 만 결과 파일 없음), 누수 없음 ----
+        await offPage.evaluate((inject) => {
+          if (inject.noVideo) window.__e2eNoVideo = true;
+          if (typeof inject.failStartedMessageAfterMs === 'number') window.__e2eFailStartedMessage = { afterMs: inject.failStartedMessageAfterMs };
+        }, sc.startFails);
+        const tClick = Date.now();
+        await popPage.click('#recordButton');
+        await popPage.waitForFunction(() => {
+          const m = document.querySelector('#message');
+          return m.classList.contains('show') && m.classList.contains('error');
+        }, { timeout: 30_000 });
+        const failMessage = await popPage.$eval('#message', el => ({ text: el.textContent, cls: el.className }));
+        result.popupMessage = failMessage.text;
+        result.checks.push({ name: `시작 실패: 팝업 오류 "${failMessage.text}" (${Date.now() - tClick} ms)`, pass: sc.expectError.test(failMessage.text) });
+        await sleep(1000); // offscreen 정리(트랙 중지·세션 정리)가 끝나도록
+        result.gc = { afterStop: await forceGc(offPage) };
+        const gcAt = Date.now();
+        const afterFail = await offPage.evaluate(async () => {
+          const out = { sessions: [], videoFiles: [] };
+          try {
+            const base = await (await navigator.storage.getDirectory()).getDirectoryHandle('recorda-recordings');
+            for await (const [name, handle] of base.entries()) {
+              if (handle.kind !== 'directory') continue;
+              out.sessions.push(name);
+              for await (const [file] of handle.entries()) if (/^video\./.test(file)) out.videoFiles.push(`${name}/${file}`);
+            }
+          } catch (e) { if (!e || e.name !== 'NotFoundError') out.error = String(e); }
+          out.tracks = window.__e2e && window.__e2e.stream ? window.__e2e.stream.getTracks().map(t => `${t.kind}:${t.readyState}`) : [];
+          return out;
+        });
+        const swState = await worker.evaluate(() => chrome.storage.session.get('recordingState').then(r => r.recordingState || null)).catch(e => ({ error: e.message }));
+        result.startFailure = { ...afterFail, swState: swState && swState.state };
+        result.checks.push({ name: `시작 실패 후 SW 상태 ${swState ? swState.state : '없음(IDLE)'}, 캡처 트랙 ${afterFail.tracks.join(', ') || '없음'}`, pass: (!swState || swState.state === 'IDLE') && afterFail.tracks.every(t => t.endsWith(':ended')) });
+        result.checks.push({ name: `시작 실패 후 OPFS 세션에 남은 쓰다 만 영상 파일 ${afterFail.videoFiles.length}개${afterFail.videoFiles.length ? ` (${afterFail.videoFiles.join(', ')})` : ''}`, pass: afterFail.videoFiles.length === 0 });
+        await settleFrameLeaks({ offPage, offLogs, result, gcAt });
+        const encoderLine = offLogs.find(l => l.includes('[VideoTrackEncoder] 정리'));
+        if (encoderLine) {
+          result.encoderStats = encoderLine;
+          try { result.encoderFrameStats = JSON.parse(encoderLine.slice(encoderLine.indexOf('{'))); } catch { /* 무시 */ }
+          const s = result.encoderFrameStats && result.encoderFrameStats.frameStats;
+          if (s) result.checks.push({ name: `시작 실패 정리: 확장 프레임 집계 read ${s.framesRead} = close ${s.framesClosed} (리더 종료 ${s.stopDrainMs} ms${s.cancelledWithPendingRead ? ', 대기 read 남은 채 cancel' : ''})`, pass: s.framesRead === s.framesClosed });
+        }
+        result.ok = result.checks.every(c => c.pass);
+        throw new ScenarioDone();
+      }
+
+      // 녹화 시작 (encoder-error-mp4: N번째 encode 직전에 인코더를 닫는 오류 주입)
+      if (sc.encoderFailAfter) await offPage.evaluate((n) => { window.__e2eEncoderFailAfter = n; }, sc.encoderFailAfter);
       const sampler2 = new ResourceSampler(browserPid, () => offPage.metrics().then(m => m.JSHeapUsedSize / 1048576));
       sampler2.start(1000);
       const t0 = Date.now();
       await popPage.click('#recordButton');
       await popPage.waitForFunction(() => /녹화 중|녹음 중/.test(document.querySelector('#status').textContent), { timeout: 20_000 });
       const startLatencyMs = Date.now() - t0;
-      const statusText = await popPage.$eval('#status', el => el.textContent);
-      result.checks.push({ name: `popup: 시작 후 상태 "${statusText.trim()}" (${startLatencyMs}ms)`, pass: true });
+      // quick-stop: 녹화 중 표시가 뜨자마자 중지 (아래 대기·확인 단계는 중지 뒤로 미룸)
+      const statusText = sc.quickStop ? '' : await popPage.$eval('#status', el => el.textContent);
+      if (!sc.quickStop) result.checks.push({ name: `popup: 시작 후 상태 "${statusText.trim()}" (${startLatencyMs}ms)`, pass: true });
+
+      // 녹화 중간에 한 번 GC 강제 (일시정지 시나리오는 일시정지 구간 한가운데): 녹화 중 버려진 프레임 경고를 드러냄
+      let midGcTimer = null;
+      if (!sc.quickStop && duration >= 2) {
+        const midAtMs = sc.pause ? (sc.pause.at + sc.pause.seconds / 2) * 1000 : duration * 500;
+        midGcTimer = setTimeout(() => {
+          const at = Date.now() - t0;
+          forceGc(offPage).then((how) => { result.gc = { ...(result.gc || {}), midRecording: how, midRecordingAtMs: at }; });
+        }, Math.max(0, midAtMs - (Date.now() - t0)));
+      }
 
       // 캡처 제약 확인
-      await sleep(500);
-      const constraints = await offPage.evaluate(() => window.__e2e.constraints);
-      result.checks.push({ name: 'getUserMedia: video 제약 요청 여부가 모드와 일치', pass: !!constraints.video === (sc.mode !== 'AUDIO_ONLY'), detail: JSON.stringify(constraints.video || false) });
+      const checkConstraints = async () => {
+        const constraints = await offPage.evaluate(() => window.__e2e.constraints);
+        result.checks.push({ name: 'getUserMedia: video 제약 요청 여부가 모드와 일치', pass: !!constraints.video === (sc.mode !== 'AUDIO_ONLY'), detail: JSON.stringify(constraints.video || false) });
+      };
+      if (!sc.quickStop) {
+        await sleep(500);
+        await checkConstraints();
+      }
 
       // 녹화 진행 대기 (10초 단위로 컨테이너 메모리 확인)
       let aborted = null;
@@ -880,7 +1224,9 @@ async function main() {
         }
       };
       const toSeconds = (text) => text.trim().split(':').reduce((acc, v) => acc * 60 + Number(v), 0);
-      if (sc.pause) {
+      if (sc.quickStop) {
+        // 바로 중지
+      } else if (sc.pause) {
         await recordFor(sc.pause.at);
         if (!aborted) await checkPauseResume(sc, result, popPage, worker, toSeconds);
         if (!aborted) await recordFor(duration - sc.pause.at);
@@ -889,8 +1235,8 @@ async function main() {
       }
       result.abortedEarly = aborted;
       if (aborted) result.checks.push({ name: aborted, pass: false });
-      const elapsedText = await popPage.$eval('#timeDisplay', el => el.textContent);
-      result.checks.push({ name: `popup: 경과 시간 표시 ${elapsedText}`, pass: elapsedText !== '00:00' });
+      const elapsedText = sc.quickStop ? '' : await popPage.$eval('#timeDisplay', el => el.textContent);
+      if (!sc.quickStop) result.checks.push({ name: `popup: 경과 시간 표시 ${elapsedText}`, pass: elapsedText !== '00:00' });
       if (sc.pause) {
         // 팝업 시간도 일시정지를 뺀 녹화 시간이어야 함 (일시정지 포함 시 약 16초)
         result.checks.push({ name: `popup: 중지 직전 표시 ${elapsedText.trim()} ≈ 녹화 ${duration}s (일시정지 ${sc.pause.seconds}s 제외)`, pass: Math.abs(toSeconds(elapsedText) - duration) <= 1.5 });
@@ -962,8 +1308,10 @@ async function main() {
       }
 
       // 실제 Chrome의 storage.session에 녹화 상태가 영속화되는지 (SW 재시작 복구의 전제)
-      const session = await worker.evaluate(() => chrome.storage.session.get('recordingState').then(r => r.recordingState)).catch(e => ({ error: e.message }));
-      result.checks.push({ name: `SW storage.session에 RECORDING 상태 저장됨 (${session && session.state})`, pass: !!session && session.state === 'RECORDING' && typeof session.startTime === 'number' });
+      if (!sc.quickStop) {
+        const session = await worker.evaluate(() => chrome.storage.session.get('recordingState').then(r => r.recordingState)).catch(e => ({ error: e.message }));
+        result.checks.push({ name: `SW storage.session에 RECORDING 상태 저장됨 (${session && session.state})`, pass: !!session && session.state === 'RECORDING' && typeof session.startTime === 'number' });
+      }
       const heartbeats = swLogs.filter(l => /RECORDING_HEARTBEAT/.test(l)).length;
       result.swHeartbeatsSeen = heartbeats;
       if (sc.resizeAt) {
@@ -973,8 +1321,21 @@ async function main() {
 
       // 녹화 중지 → 완료 대기
       evictFast = true;
+      if (midGcTimer) clearTimeout(midGcTimer);
       const tStop = Date.now();
-      await popPage.click('#recordButton');
+      if (sc.quickStop) result.quickStopRecordedMs = tStop - t0 - startLatencyMs;
+      if (sc.endTrack) {
+        // 탭 닫힘 흉내: 가짜 소스의 캡처 트랙을 멈추고 ended 이벤트를 보냄 (중지 클릭 없이 확장이 스스로 마무리해야 함)
+        const ended = await offPage.evaluate(() => {
+          const tracks = window.__e2e.stream.getTracks();
+          for (const t of tracks) t.stop();
+          for (const t of tracks) t.dispatchEvent(new Event('ended'));
+          return tracks.map(t => `${t.kind}:${t.readyState}`);
+        });
+        result.endedTracks = ended;
+      } else {
+        await popPage.click('#recordButton');
+      }
       // 중지 클릭부터 "다시 녹화 가능"(대기 중·버튼 활성·SW IDLE, 폴더 저장이면 OPFS 임시 정리)까지를 동시에 감시
       const readyPromise = waitUntilReady({ popPage, worker, offPage, tStop, requireTempCleaned: saveToFolder, timeoutMs: Math.max(180_000, duration * 1000) });
       // 최종 메시지(success/error)까지 대기. 중간의 "저장 중..." info 메시지는 통과하지 않음
@@ -990,7 +1351,49 @@ async function main() {
       const message = await popPage.$eval('#message', el => ({ text: el.textContent, cls: el.className }));
       result.popupMessage = message.text;
       result.stopProcessingMs = stopLatencyMs;
-      result.checks.push({ name: `popup: 완료 메시지 "${message.text}" (${stopLatencyMs}ms, 저장 중 표시: ${sawSaving ? '있음' : '없음'})`, pass: message.cls.includes('success') });
+      result.checks.push(sc.expectError
+        ? { name: `popup: 오류 메시지 "${message.text}" (${stopLatencyMs}ms)`, pass: message.cls.includes('error') && sc.expectError.test(message.text) }
+        : { name: `popup: 완료 메시지 "${message.text}" (${stopLatencyMs}ms, 저장 중 표시: ${sawSaving ? '있음' : '없음'})`, pass: message.cls.includes('success') });
+      if (sc.quickStop) {
+        await checkConstraints();
+        log(`  시작 직후 중지: 녹화 중 표시 → 중지 클릭 ${result.quickStopRecordedMs} ms (시작 클릭 → 녹화 중 표시 ${startLatencyMs} ms)`);
+      }
+
+      // 중지 직후 GC 강제 (중지 처리에서 버려진 프레임까지 수거) → 파일 검증 뒤 시나리오 끝에서 누수 경고를 셈
+      await sleep(500);
+      result.gc = { ...(result.gc || {}), afterStop: await forceGc(offPage) };
+      let leakGcAt = Date.now();
+      const encoderStatsOf = () => {
+        const line = offLogs.find(l => /\[VideoTrackEncoder\] (완료|정리|인코딩 실패로 종료)/.test(l));
+        if (!line) return null;
+        try { return JSON.parse(line.slice(line.indexOf('{'))); } catch { return null; }
+      };
+      // 확장(VideoTrackEncoder.stats) 집계: 리더가 전달한 프레임 = 닫은 프레임, 하네스 집계(frameTally)와 같은 수
+      const checkEncoderFrameStats = () => {
+        const s = result.encoderFrameStats && result.encoderFrameStats.frameStats;
+        if (!s) return;
+        result.checks.push({
+          name: `확장 프레임 집계: read ${s.framesRead} = close ${s.framesClosed} (encode ${s.framesEncoded}, 중지 뒤 도착 ${s.framesAfterStop}, 정규화 ${s.normalizedCreated}→${s.normalizedClosed}, 리더 종료 ${s.stopDrainMs} ms${s.cancelledWithPendingRead ? ', 대기 read 남은 채 cancel' : ''})${result.frameTally ? `, 하네스 집계 read ${result.frameTally.read}` : ''}`,
+          pass: s.framesRead === s.framesClosed && s.normalizedCreated === s.normalizedClosed && (!result.frameTally || result.frameTally.read === s.framesRead)
+        });
+      };
+
+      if (sc.expectError) {
+        // 오류로 끝나는 시나리오 (encoder-error-mp4): 파일은 없어야 하고 누수 검사만
+        const ready = await readyPromise;
+        result.stopToReadyMs = ready.readyMs;
+        result.readyState = ready;
+        const sent = await offPage.evaluate(() => window.__e2eSent || []);
+        result.checks.push({ name: `오류 종료: DOWNLOAD_FILE ${sent.filter(m => m.action === 'DOWNLOAD_FILE').length}개, RECORDING_ERROR ${sent.filter(m => m.action === 'RECORDING_ERROR').length}개, 다시 녹화 가능 ${ready.readyMs} ms`, pass: !sent.some(m => m.action === 'DOWNLOAD_FILE') && typeof ready.readyMs === 'number' });
+        await settleFrameLeaks({ offPage, offLogs, result, gcAt: leakGcAt });
+        const lines = offLogs.filter(l => l.includes('[VideoTrackEncoder]') && /완료|정리|실패|인코더 에러|encode/.test(l));
+        result.encoderStats = lines.slice(0, 4).join(' | ');
+        result.encoderFrameStats = encoderStatsOf();
+        checkEncoderFrameStats();
+        result.resources = summarize(samples, baseline);
+        result.ok = result.checks.every(c => c.pass);
+        throw new ScenarioDone();
+      }
 
       let files = [];
       if (saveToFolder) {
@@ -1033,8 +1436,13 @@ async function main() {
         result.checks.push({ name: `중지 → 다시 녹화 가능(대기 중·버튼 활성·SW IDLE·OPFS 임시 정리) ${ready.readyMs} ms`, pass: typeof ready.readyMs === 'number' });
         const expectedDuration = new Map(created.map(e => [e.name, duration]));
         if (RECORD_AGAIN_SEC > 0) {
+          // 다시 녹화는 offscreen 문서를 새로 불러오므로(이전 문서의 경고는 사라짐) 첫 녹화의 누수 검사를 먼저 마침
+          await settleFrameLeaks({ offPage, offLogs, result, gcAt: leakGcAt, label: '첫 녹화: ' });
           log(`  같은 브라우저에서 다시 녹화 ${RECORD_AGAIN_SEC}초...`);
           const again = await recordAgain({ seconds: RECORD_AGAIN_SEC, popPage, offPage, worker, extensionId, saveToFolder });
+          await sleep(500);
+          result.gc.afterRecordAgain = await forceGc(offPage);
+          leakGcAt = Date.now();
           result.recordAgain = again;
           const at = again.recordingComplete && again.recordingComplete.timings;
           log(`  다시 녹화: 시작 ${again.startLatencyMs} ms, 중지 → RECORDING_COMPLETE ${again.stopToCompleteMs} ms, → 팝업 완료 ${again.stopToPopupMs} ms, → 다시 녹화 가능 ${again.stopToReadyMs} ms | 파일 ${again.created.map(e => `${e.name} ${(e.size / 1048576).toFixed(2)} MB`).join(', ')} | offscreen 단계별(ms) ${JSON.stringify(at)}`);
@@ -1189,10 +1597,15 @@ async function main() {
       const fakeFrames = await offPage.evaluate(() => window.__e2e.frames).catch(() => null);
       result.sourceFramesDrawn = fakeFrames;
 
+      // VideoFrame 누수 검사 (중지 직후 GC로부터 LEAK_SETTLE_MS 경과 후) + 확장의 프레임 집계 (VideoTrackEncoder 완료 로그)
+      await settleFrameLeaks({ offPage, offLogs, result, gcAt: leakGcAt, label: RECORD_AGAIN_SEC > 0 && saveToFolder ? '다시 녹화까지: ' : '' });
+      result.encoderFrameStats = encoderStatsOf();
+      checkEncoderFrameStats();
+
       result.resources = summarize(samples, baseline);
       result.ok = result.checks.every(c => c.pass);
     } catch (error) {
-      if (!(error instanceof CrashDone)) {
+      if (!(error instanceof CrashDone) && !(error instanceof ScenarioDone)) {
         result.error = error.message;
         result.ok = false;
         log('오류:', error.message);
@@ -1224,6 +1637,19 @@ async function main() {
   if (throttle) { report.throttle = throttle.summary(0); throttle.stop(); }
   report.swLogsTail = swLogs.slice(-30);
   report.finishedAt = new Date().toISOString();
+  // VideoFrame 누수 요약 (시나리오별 Chrome 경고 수 + 하네스 집계 + 확장의 프레임 집계)
+  report.leakSummary = report.scenarios.map(s => ({
+    id: s.id,
+    videoFrameLeakWarnings: s.videoFrameLeakWarnings ?? null,
+    gc: s.gc || null,
+    tally: s.frameTally ? (({ read, readClosed, created, createdClosed, encodeCalls, encodeThrows, leakedRead, leakedCreated }) => ({ read, readClosed, created, createdClosed, encodeCalls, encodeThrows, leakedRead, leakedCreated }))(s.frameTally) : null,
+    encoder: s.encoderFrameStats ? (s.encoderFrameStats.frameStats || s.encoderFrameStats) : null
+  }));
+  log('VideoFrame 누수 요약 (Chrome 경고 / 리더 프레임 read→close / new VideoFrame→close / close 없이 GC):');
+  for (const s of report.leakSummary) {
+    const t = s.tally;
+    log(`  ${s.id.padEnd(24)} 경고 ${s.videoFrameLeakWarnings ?? '-'}${t ? ` | 리더 ${t.read}→${t.readClosed} | 생성 ${t.created}→${t.createdClosed} | encode ${t.encodeCalls} | GC 누수 ${t.leakedRead + t.leakedCreated}` : ''}`);
+  }
   report.passed = report.scenarios.filter(s => s.ok).length;
   report.total = report.scenarios.length;
   writeFileSync(join(OUT_DIR, 'report.json'), JSON.stringify(report, null, 2));

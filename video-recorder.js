@@ -44,6 +44,8 @@ export function computeVideoBitrate(width, height, frameRate, settings = VIDEO_S
   return Math.min(settings.MAX_BITRATE, Math.max(settings.MIN_BITRATE, estimate));
 }
 
+const realNow = () => (globalThis.performance ? performance.now() : Date.now());
+
 function defaultDeps() {
   return {
     VideoEncoder: globalThis.VideoEncoder,
@@ -122,6 +124,26 @@ export class VideoTrackEncoder {
     this.stopRequested = false;
     this.ended = false;
     this.encoderError = null;
+    this.finished = false;            // stop()이 끝남 (이후 dispose는 할 일 없음)
+
+    // VideoFrame 수명 집계: 리더가 전달한 프레임은 어떤 경로든 releaseFrame()에서 정확히 한 번 닫음 (stop 후 framesRead = framesClosed)
+    this.stats = {
+      framesRead: 0,            // 리더가 전달한 프레임
+      framesClosed: 0,          // 그중 닫은 프레임
+      framesEncoded: 0,         // encode()에 넘긴 프레임
+      framesAfterStop: 0,       // 중지 요청 뒤 받은 프레임 (대기 중이던 read의 결과, 인코딩하지 않고 닫음)
+      normalizedCreated: 0,     // 정규화(레터박스)로 만든 VideoFrame
+      normalizedClosed: 0,      // 그중 닫은 프레임
+      stopDrainMs: 0,           // 중지 때 대기 중 read를 기다리고 리더를 끝내기까지 걸린 시간
+      cancelledWithPendingRead: false // 진단: 대기 read가 남은 채 cancel (전달 중인 프레임이 없다고 보고 기다리지 않았거나 상한 초과)
+    };
+    this.releasedFrames = new WeakSet(); // 같은 프레임을 두 번 세지 않도록
+    this.readPending = false;   // 대기 중인 read가 있음 (아직 프레임도 done도 받지 않음)
+    this.readStartedAt = null;  // 트랙 읽기 시작 시각 (deps.now)
+    this.lastFrameAt = null;    // 마지막 프레임 도착 시각 (deps.now)
+    this.frameIntervalMs = null; // 프레임 도착 간격 (지수 이동 평균): 중지 때 다음 프레임을 기다릴지 판단
+    this.readerShutdown = null; // shutdownReader() 진행/완료 (한 번만)
+    this.disposeLogged = false;
   }
 
   /** 지금까지 받은 인코딩 샘플 수 */
@@ -165,6 +187,11 @@ export class VideoTrackEncoder {
     }
 
     this.codec = await this.probeCodec();
+    // 코덱을 조회하는 동안 중지·정리가 요청됨 (시작 직후 중지, 시작 실패 정리): 인코더를 만들거나 트랙 읽기를 시작하지 않음
+    if (this.stopRequested) {
+      console.log('[VideoTrackEncoder] 시작 중 중지 요청 → 인코더·트랙 읽기를 시작하지 않음');
+      return;
+    }
 
     this.encoder = new VideoEncoder({
       output: (chunk, metadata) => this.handleChunk(chunk, metadata),
@@ -176,6 +203,7 @@ export class VideoTrackEncoder {
 
     const processor = new MediaStreamTrackProcessor({ track: this.track });
     this.reader = processor.readable.getReader();
+    this.readStartedAt = this.deps.now();
     this.readLoop = this.runReadLoop();
   }
 
@@ -224,74 +252,188 @@ export class VideoTrackEncoder {
     console.log('[VideoTrackEncoder] 인코더 설정:', { codec: this.codec, width: this.width, height: this.height, bitrate });
   }
 
+  /**
+   * 트랙 읽기 루프. read는 한 번에 하나만 대기시키고, 리더가 전달한 프레임은 처리 결과(인코딩·드롭·일시정지·인코더 오류·
+   * 중지 뒤 도착)와 상관없이 releaseFrame()에서 정확히 한 번 닫습니다. 중지가 요청되면 대기 중이던 read의 결과만 받아 닫고
+   * 더 읽지 않습니다 (리더를 언제 cancel하는지는 shutdownReader 참고).
+   */
   async runReadLoop() {
+    const reader = this.reader;
+    const settle = () => { this.readPending = false; };
     try {
       while (!this.stopRequested) {
-        const { value: frame, done } = await this.reader.read();
+        const read = reader.read();
+        this.readPending = true;
+        read.then(settle, settle); // 결과가 나오는 즉시 (루프가 이어서 처리하기 전에) 대기 해제
+        const { value: frame, done } = (await read) || {};
         if (done) {
           this.ended = true;
           break;
         }
         if (!frame) continue;
-
+        this.noteFrameArrival();
         try {
-          if (this.encoderError) {
-            frame.close();
-            continue;
+          this.processFrame(frame);
+        } catch (error) {
+          // 프레임 처리 중 동기 예외 (configure 실패, 닫힌 코덱의 encode 등): 인코더 오류로 기록하고 이후 프레임도 계속 읽어
+          // 인코딩 없이 닫음 (읽기를 멈추면 대기 read 없이 트랙이 계속 프레임을 내고, 중지 때 정리 경로도 달라짐)
+          if (!this.encoderError) {
+            console.error('[VideoTrackEncoder] 프레임 처리 실패 - 이후 프레임은 인코딩하지 않고 닫습니다:', error);
+            this.encoderError = error;
           }
-
-          if (this.paused) {
-            // 일시정지 중: 인코딩하지 않음 (finally에서 close). 드롭이 아니므로 droppedFrames에 세지 않음
-            this.pausedFrames++;
-            continue;
-          }
-
-          if (this.frameCount === 0) {
-            this.firstFrameTime = this.deps.now();
-            if (typeof this.audioStartTime === 'number') {
-              // 첫 프레임 전에 일시정지했다면 그동안 오디오도 버려졌으므로 그 시간은 정렬 오프셋에서 뺌
-              this.alignmentOffsetUs = Math.max(0, Math.round((this.firstFrameTime - this.audioStartTime) * 1000) - this.pendingPauseWallUs);
-            }
-            // 첫 프레임은 원점(키프레임)이므로 이어 붙일 간격이 없음
-            this.pendingPauseWallUs = 0;
-            this.resumePending = false;
-            this.configureForFrame(frame);
-          }
-
-          if (this.encoder.encodeQueueSize > this.settings.MAX_ENCODE_QUEUE) {
-            this.droppedFrames++;
-            frame.close();
-            continue;
-          }
-
-          // 재개 후 첫 프레임: 일시정지 구간을 타임스탬프에서 빼고, 이 지점부터 단독 디코딩 가능하도록 키프레임
-          let resumeKeyFrame = false;
-          if (this.resumePending) {
-            this.resumePending = false;
-            this.applyPauseGap(frame.timestamp);
-            resumeKeyFrame = true;
-          }
-
-          // 탭 크기가 바뀌면 프레임 크기도 바뀌므로 설정 크기의 캔버스에 레터박스로 맞춤 (avcC는 파일당 하나)
-          const input = this.normalizeFrame(frame);
-          const keyFrame = resumeKeyFrame || this.frameCount % this.settings.KEYFRAME_INTERVAL === 0;
-          try {
-            this.encoder.encode(input, { keyFrame });
-          } finally {
-            if (input !== frame) { try { input.close(); } catch { /* 무시 */ } }
-          }
-          this.lastEncodedTimestamp = frame.timestamp;
-          this.frameCount++;
         } finally {
-          try { frame.close(); } catch { /* 이미 닫힘 */ }
+          this.releaseFrame(frame);
         }
       }
     } catch (error) {
+      // read() 자체가 실패 (스트림 오류)
       if (!this.stopRequested) {
         console.error('[VideoTrackEncoder] 프레임 읽기 실패:', error);
         this.encoderError = this.encoderError || error;
       }
+    } finally {
+      this.readPending = false;
     }
+  }
+
+  /** 프레임 하나 처리 (프레임은 호출자 runReadLoop가 releaseFrame으로 닫음) */
+  processFrame(frame) {
+    if (this.stopRequested) {
+      // 중지 요청 뒤 받은 프레임 (대기 중이던 read의 결과): 인코딩하지 않음
+      this.stats.framesAfterStop++;
+      return;
+    }
+    if (this.encoderError) return;
+
+    if (this.paused) {
+      // 일시정지 중: 인코딩하지 않음. 드롭이 아니므로 droppedFrames에 세지 않음
+      this.pausedFrames++;
+      return;
+    }
+
+    if (this.frameCount === 0) {
+      this.firstFrameTime = this.deps.now();
+      if (typeof this.audioStartTime === 'number') {
+        // 첫 프레임 전에 일시정지했다면 그동안 오디오도 버려졌으므로 그 시간은 정렬 오프셋에서 뺌
+        this.alignmentOffsetUs = Math.max(0, Math.round((this.firstFrameTime - this.audioStartTime) * 1000) - this.pendingPauseWallUs);
+      }
+      // 첫 프레임은 원점(키프레임)이므로 이어 붙일 간격이 없음
+      this.pendingPauseWallUs = 0;
+      this.resumePending = false;
+      this.configureForFrame(frame);
+    }
+
+    if (this.encoder.encodeQueueSize > this.settings.MAX_ENCODE_QUEUE) {
+      this.droppedFrames++;
+      return;
+    }
+
+    // 재개 후 첫 프레임: 일시정지 구간을 타임스탬프에서 빼고, 이 지점부터 단독 디코딩 가능하도록 키프레임
+    let resumeKeyFrame = false;
+    if (this.resumePending) {
+      this.resumePending = false;
+      this.applyPauseGap(frame.timestamp);
+      resumeKeyFrame = true;
+    }
+
+    // 탭 크기가 바뀌면 프레임 크기도 바뀌므로 설정 크기의 캔버스에 레터박스로 맞춤 (avcC는 파일당 하나)
+    const input = this.normalizeFrame(frame);
+    const keyFrame = resumeKeyFrame || this.frameCount % this.settings.KEYFRAME_INTERVAL === 0;
+    try {
+      // VideoEncoder는 넘긴 프레임을 내부에서 복제해 쓰므로 원본·정규화 프레임은 encode 직후 닫아도 됨
+      this.encoder.encode(input, { keyFrame });
+    } finally {
+      if (input !== frame) this.releaseFrame(input, 'normalized');
+    }
+    this.stats.framesEncoded++;
+    this.lastEncodedTimestamp = frame.timestamp;
+    this.frameCount++;
+  }
+
+  /**
+   * VideoFrame 해제 (모든 경로가 이 함수로): 이미 닫혔거나 close()가 실패해도 안전하고, 같은 프레임을 두 번 세지 않습니다.
+   * @param {VideoFrame} frame
+   * @param {'read'|'normalized'} kind - 리더가 전달한 프레임 / 정규화로 만든 프레임
+   */
+  releaseFrame(frame, kind = 'read') {
+    if (!frame || this.releasedFrames.has(frame)) return;
+    this.releasedFrames.add(frame);
+    try { frame.close(); } catch { /* 이미 닫힘 */ }
+    if (kind === 'normalized') this.stats.normalizedClosed++;
+    else this.stats.framesClosed++;
+  }
+
+  /**
+   * 프레임 도착 기록: 개수, 시각, 간격(지수 이동 평균) - 간격은 중지 때 다음 프레임을 기다릴지 정하는 데만 사용.
+   * 1ms 미만 간격(같은 순간 몰려 들어온 프레임, 예: 프로세서가 막 시작해 쌓인 프레임을 연달아 줄 때)은 간격으로 치지 않음
+   */
+  noteFrameArrival() {
+    this.stats.framesRead++;
+    const t = this.deps.now();
+    if (this.lastFrameAt !== null) {
+      const gap = t - this.lastFrameAt;
+      if (gap >= 1) this.frameIntervalMs = this.frameIntervalMs === null ? gap : this.frameIntervalMs * 0.75 + gap * 0.25;
+    }
+    this.lastFrameAt = t;
+  }
+
+  /**
+   * 중지 때 대기 중 read를 기다릴 시간(ms), 상한 settings.STOP_DRAIN_TIMEOUT_MS. 프레임 간격은 잰 평균과 명목 간격(1/FRAME_RATE) 중 큰
+   * 값으로 봅니다 (캡처는 maxFrameRate를 넘지 않으므로 시작 직후 몰려 온 프레임이 평균을 줄여도 다음 프레임은 명목 간격 뒤에 옴).
+   * - 프레임이 꾸준히 오던 중: 마지막 프레임 + 간격 4배까지 (보통 다음 프레임이 한 간격 안에 와서 바로 끝남)
+   * - 첫 프레임 전(시작 직후 중지): 읽기 시작 + 명목 간격 3배까지 (막 시작한 프로세서가 첫 프레임을 전달 중일 수 있음)
+   * - 정적인 화면이라 프레임이 끊김(마지막 프레임이 오래 전): 전달 중인 프레임도 없으므로 기다리지 않음
+   * - 3개 이상이 모두 같은 순간에 들어옴(잰 간격 없음, 테스트용 가짜 소스): 간격을 알 수 없으므로 기다리지 않음
+   */
+  stopDrainWaitMs() {
+    const limit = this.settings.STOP_DRAIN_TIMEOUT_MS ?? VIDEO_SETTINGS.STOP_DRAIN_TIMEOUT_MS;
+    const nominal = 1000 / (this.settings.FRAME_RATE || VIDEO_SETTINGS.FRAME_RATE);
+    const clamp = (ms) => Math.max(0, Math.min(limit, ms));
+    if (this.stats.framesRead === 0) {
+      return this.readStartedAt === null ? 0 : clamp(this.readStartedAt + 3 * nominal - this.deps.now());
+    }
+    if (this.frameIntervalMs === null && this.stats.framesRead >= 3) return 0;
+    const interval = Math.max(this.frameIntervalMs ?? 0, nominal);
+    return clamp(this.lastFrameAt + 4 * interval - this.deps.now());
+  }
+
+  /**
+   * 리더 종료 (stop·dispose 공통, 한 번만 실행).
+   * Chrome의 MediaStreamTrackProcessor는 read가 대기 중이면 다음 프레임을 VideoFrame으로 만든 뒤 별도 작업으로 스트림에 넣습니다.
+   * 그 사이에 리더를 cancel하거나 트랙을 멈춰 스트림이 닫히면 그 프레임은 아무에게도 전달되지 못하고 close 없이 버려져, GC 때
+   * "A VideoFrame was garbage collected without being closed" 경고가 납니다 (헤드리스 Chrome 148 실측: 중지마다 약 7%).
+   * 그래서 프레임이 오던 중이면 대기 중 read가 다음 프레임을 받을 때까지 기다리고(루프는 그 프레임을 인코딩하지 않고 닫은 뒤 더 읽지
+   * 않음) 대기 read가 없을 때 cancel합니다. 트랙(offscreen의 캡처 트랙)은 이 함수가 끝난 뒤에 멈춰야 합니다.
+   */
+  shutdownReader() {
+    if (!this.readerShutdown) this.readerShutdown = this.runReaderShutdown();
+    return this.readerShutdown;
+  }
+
+  async runReaderShutdown() {
+    if (!this.reader) return;
+    const t0 = realNow();
+    if (this.readLoop && this.readPending) {
+      const waitMs = this.stopDrainWaitMs();
+      if (waitMs > 0) {
+        let timer = null;
+        await Promise.race([this.readLoop, new Promise((resolve) => { timer = setTimeout(resolve, waitMs); })]);
+        clearTimeout(timer);
+      }
+    }
+    this.stats.cancelledWithPendingRead = this.readPending;
+    try {
+      await this.reader.cancel();
+    } catch (error) {
+      console.warn('[VideoTrackEncoder] reader.cancel 실패:', error);
+    }
+    if (this.readLoop) await this.readLoop;
+    this.stats.stopDrainMs = Math.round(realNow() - t0);
+  }
+
+  /** 로그·세션 통계용 프레임 집계 사본 */
+  frameStats() {
+    return { ...this.stats };
   }
 
   /**
@@ -375,8 +517,12 @@ export class VideoTrackEncoder {
       ctx.fillStyle = '#000';
       ctx.fillRect(0, 0, this.width, this.height);
       ctx.drawImage(frame, x, y, drawW, drawH);
+      // 그리기가 모두 끝난 뒤 마지막 단계에서만 VideoFrame을 만듦 → 만든 뒤에 실패해 버려지는 정규화 프레임이 없음
+      // (만든 프레임은 호출자가 encode 직후 releaseFrame으로 닫음)
+      const normalized = new VideoFrame(this.canvas, { timestamp: frame.timestamp, duration: frame.duration ?? undefined });
       this.normalizedFrames++;
-      return new VideoFrame(this.canvas, { timestamp: frame.timestamp, duration: frame.duration ?? undefined });
+      this.stats.normalizedCreated++;
+      return normalized;
     } catch (error) {
       console.warn('[VideoTrackEncoder] 프레임 정규화 실패, 원본 사용:', error);
       return frame;
@@ -427,13 +573,8 @@ export class VideoTrackEncoder {
    */
   async stop() {
     this.stopRequested = true;
-
-    if (this.reader) {
-      try { await this.reader.cancel(); } catch (error) { console.warn('[VideoTrackEncoder] reader.cancel 실패:', error); }
-    }
-    if (this.readLoop) {
-      await this.readLoop;
-    }
+    // 리더를 안전하게 끝냄: 대기 중 read를 처리한 뒤 cancel (Chrome 내부 프레임 누수 방지, shutdownReader 참고)
+    await this.shutdownReader();
 
     if (this.encoder && this.encoder.state === 'configured') {
       try {
@@ -448,6 +589,8 @@ export class VideoTrackEncoder {
     }
 
     if (this.encoderError) {
+      this.finished = true; // 인코더·리더는 정리됨 (결과 파일 처리는 세션이 함)
+      console.warn('[VideoTrackEncoder] 인코딩 실패로 종료:', { frames: this.frameCount, dropped: this.droppedFrames, samples: this.sampleCount, frameStats: this.frameStats() });
       throw new Error(`${ERROR_MESSAGES.VIDEO_ENCODING_FAILED} (${this.encoderError.message || this.encoderError})`);
     }
 
@@ -457,8 +600,26 @@ export class VideoTrackEncoder {
 
     const storage = this.sampleSink ? (this.sampleSink.kind || 'sink') : (this.chunkStore ? this.chunkStore.kind : 'memory');
     const indexBytes = this.index ? this.index.bytesUsed : (this.sampleSink && this.sampleSink.indexBytes) || 0;
-    console.log('[VideoTrackEncoder] 완료:', { frames: this.frameCount, dropped: this.droppedFrames, paused: this.pausedFrames, pauseOffsetMs: Math.round(this.pauseOffsetUs / 1000), normalized: this.normalizedFrames, scaled: this.scaledFrames, samples: this.sampleCount, storage, indexMB: +(indexBytes / 1048576).toFixed(1) });
+    this.finished = true;
+    console.log('[VideoTrackEncoder] 완료:', { frames: this.frameCount, dropped: this.droppedFrames, paused: this.pausedFrames, pauseOffsetMs: Math.round(this.pauseOffsetUs / 1000), normalized: this.normalizedFrames, scaled: this.scaledFrames, samples: this.sampleCount, storage, indexMB: +(indexBytes / 1048576).toFixed(1), frameStats: this.frameStats() });
     return this.getTrack();
+  }
+
+  /**
+   * 결과 없이 정리 (시작 실패·세션 폐기, 여러 번 불러도 안전): 리더를 안전하게 끝내고(shutdownReader) 인코더를 flush 없이 닫습니다.
+   * encode()에 넘긴 프레임은 인코더가 내부 복제본으로 쓰고 close 때 Chrome이 해제하므로, 우리 쪽에 남는 프레임은 없습니다.
+   * stop()을 마친 뒤에는 할 일이 없습니다.
+   */
+  async dispose() {
+    this.stopRequested = true;
+    await this.shutdownReader();
+    if (this.encoder && this.encoder.state !== 'closed') {
+      try { this.encoder.close(); } catch { /* 무시 */ }
+    }
+    if (!this.finished && !this.disposeLogged) {
+      this.disposeLogged = true;
+      console.log('[VideoTrackEncoder] 정리:', { frames: this.frameCount, dropped: this.droppedFrames, paused: this.pausedFrames, samples: this.sampleCount, frameStats: this.frameStats() });
+    }
   }
 
   /**
@@ -530,16 +691,38 @@ export class VideoRecordingSession {
     this.audioEncoder = null;
     this.paused = false;
     this.stats = { videoFrames: 0, droppedFrames: 0, pausedFrames: 0, audioFrames: 0, bytes: 0 };
+    this.chunkStores = [];    // AVI 청크 저장소 (정리 시 삭제)
+    this.stopPromise = null;  // stop() 진행/결과 (한 번만 실행)
+    this.finished = false;    // stop()이 결과 파일을 완성함 → dispose는 아무것도 지우지 않음
+    this.disposed = false;
+    this.disposing = null;
+  }
+
+  /** dispose()가 start() 도중에 불려 시작을 중단할 때의 오류 */
+  disposedDuringStart() {
+    return new Error('영상 세션이 정리되어 시작을 중단했습니다');
   }
 
   async start() {
+    if (this.disposed) throw this.disposedDuringStart();
     if (this.writesDirectly) {
       await this.startWriter();
+      if (this.disposed) {
+        // 결과 파일을 여는 동안 정리됨: 방금 연 결과 파일(사용자 폴더의 빈 대상 파일 포함)을 지우고 트랙 읽기를 시작하지 않음
+        if (this.writer) { try { await this.writer.abort({ remove: true }); } catch { /* 무시 */ } }
+        throw this.disposedDuringStart();
+      }
       this.videoEncoder = new VideoTrackEncoder({ track: this.videoTrack, sampleSink: this.writer, deps: this.deps, settings: this.settings });
       this.audioEncoder = new ContainerAudioEncoder({ ...this.audioOptions, frameSink: this.writer });
     } else {
       const videoStore = this.storage ? await this.storage.createChunkStore('video.bin') : null;
+      if (videoStore) this.chunkStores.push(videoStore);
       const audioStore = this.storage ? await this.storage.createChunkStore('container-audio.bin') : null;
+      if (audioStore) this.chunkStores.push(audioStore);
+      if (this.disposed) {
+        await this.disposeChunkStores();
+        throw this.disposedDuringStart();
+      }
       this.videoEncoder = new VideoTrackEncoder({ track: this.videoTrack, chunkStore: videoStore, deps: this.deps, settings: this.settings });
       this.audioEncoder = new ContainerAudioEncoder({ ...this.audioOptions, chunkStore: audioStore });
     }
@@ -547,6 +730,38 @@ export class VideoRecordingSession {
     if (this.paused) this.videoEncoder.pause();
     this.audioEncoder.start();
     await this.videoEncoder.start();
+    // 코덱 조회 중에 정리됨: VideoTrackEncoder는 트랙 읽기를 시작하지 않았고, 결과 파일은 dispose가 지움
+    if (this.disposed) throw this.disposedDuringStart();
+  }
+
+  async disposeChunkStores() {
+    for (const store of this.chunkStores) {
+      try { await store.dispose(); } catch { /* 무시 */ }
+    }
+    this.chunkStores = [];
+  }
+
+  /**
+   * 결과 파일을 만들지 않고 세션 정리 (offscreen cleanup: 시작 실패, 중지 전 오류 등). 여러 번 불러도 안전합니다.
+   * 영상 리더를 안전하게 끝내고(대기 중 read 처리 후 cancel → 그 뒤에 호출자가 캡처 트랙을 멈춤) 인코더를 닫은 다음,
+   * 쓰다 만 결과 파일(사용자 폴더의 빈 대상 파일 포함)과 AVI 청크 저장소를 지웁니다.
+   * stop()이 결과 파일을 완성한 세션에는 아무것도 하지 않고, stop()이 진행 중이면 그 결과를 기다립니다.
+   */
+  dispose() {
+    if (!this.disposing) {
+      this.disposed = true;
+      this.disposing = (async () => {
+        if (this.stopPromise) {
+          try { await this.stopPromise; } catch { /* stop()이 실패 처리(쓰다 만 파일 삭제)를 이미 함 */ }
+          if (this.finished) return;
+        }
+        if (this.videoEncoder) await this.videoEncoder.dispose();
+        if (this.writer) { try { await this.writer.abort({ remove: true }); } catch { /* 무시 */ } }
+        await this.disposeChunkStores();
+        console.log('[VideoRecordingSession] 정리 (결과 파일 없이):', this.format, this.videoEncoder ? this.videoEncoder.frameStats() : '시작 전');
+      })();
+    }
+    return this.disposing;
   }
 
   /** 결과 파일 싱크를 열고 작성기 시작 (지정 출력이 실패하면 저장소 싱크로) */
@@ -637,7 +852,13 @@ export class VideoRecordingSession {
    */
   async stop() {
     if (!this.videoEncoder) throw new Error('세션이 시작되지 않았습니다');
-    return this.writesDirectly ? this.stopDirect() : this.stopChunked();
+    if (!this.stopPromise) {
+      this.stopPromise = (this.writesDirectly ? this.stopDirect() : this.stopChunked()).then((blob) => {
+        this.finished = true;
+        return blob;
+      });
+    }
+    return this.stopPromise;
   }
 
   // MP4/MOV/fMP4: 샘플은 이미 결과 파일에 있으므로 인코더 마감 후 moov(또는 마지막 조각)만 씀
@@ -674,7 +895,8 @@ export class VideoRecordingSession {
       bytes: blob.size,
       storage: 'direct',
       writer: this.writer.kind,
-      output: this.outputTarget
+      output: this.outputTarget,
+      frameStats: this.videoEncoder.frameStats()
     };
     if (this.writer.fragmentsWritten !== undefined) this.stats.fragments = this.writer.fragmentsWritten;
     console.log('[VideoRecordingSession] 기록 완료:', this.format, this.stats);
@@ -748,7 +970,8 @@ export class VideoRecordingSession {
       audioFrames: trackSampleCount(audio),
       bytes: blob.size,
       storage: this.storage ? this.storage.kind : 'memory',
-      output: this.outputTarget
+      output: this.outputTarget,
+      frameStats: this.videoEncoder.frameStats()
     };
     console.log('[VideoRecordingSession] 머싱 완료:', format, this.stats);
     return blob;

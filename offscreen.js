@@ -207,8 +207,8 @@ async function handleStartCapture(data, sendResponse) {
       sink.abort({ remove: true }).catch(() => {});
     }
 
-    // 부분적으로 생성된 리소스 정리
-    try { cleanup(); } catch (cleanupError) { console.warn('[Offscreen] 시작 실패 후 정리 중 오류:', cleanupError); }
+    // 부분적으로 생성된 리소스 정리 (이미 프레임을 읽던 영상 세션은 리더를 끝내고 쓰다 만 결과 파일을 지운 뒤 트랙을 멈춤)
+    try { await cleanup(); } catch (cleanupError) { console.warn('[Offscreen] 시작 실패 후 정리 중 오류:', cleanupError); }
 
     const errorMessage = translateCaptureError(error);
     console.error('에러 메시지:', errorMessage);
@@ -726,7 +726,7 @@ async function handleStreamingRecordingStop() {
       timings.cleanupMs = Math.round(now() - tCleanup);
     }
     console.log('[StreamingRecording] 중지 후 단계별 시간(ms):', timings);
-    cleanup();
+    await cleanup();
 
     if (files.length === 0) {
       throw videoError || new Error(ERROR_MESSAGES.ENCODING_FAILED);
@@ -762,7 +762,7 @@ async function handleStreamingRecordingStop() {
     console.log('[StreamingRecording] ✓ 녹음 완료 처리 성공:', files);
   } catch (error) {
     console.error('[StreamingRecording] 녹음 완료 처리 실패:', error);
-    try { cleanup(); } catch { /* 무시 */ }
+    try { await cleanup(); } catch { /* 무시 */ }
 
     chrome.runtime.sendMessage({
       action: MESSAGE_TYPES.RECORDING_ERROR,
@@ -843,11 +843,29 @@ function downloadViaAnchor(blobUrl, filename) {
 }
 
 // 리소스 정리 (메모리 누수 방지)
-function cleanup() {
+// 모듈 상태는 처음에 바로 비우고(정리하는 동안 시작한 다음 녹화와 섞이지 않게) 리소스는 지역 변수로 넘겨 아래 순서로 해제합니다.
+// 영상 세션이 남아 있으면(시작 실패, 중지 전 오류 - 참조만 버리면 리더·인코더·결과 파일이 그대로 남음) 먼저 dispose합니다:
+// 대기 중 read를 처리해 리더를 끝내고 인코더를 닫고 쓰다 만 결과 파일을 지움. 캡처 트랙은 그다음에 멈춥니다 - 대기 read가 있는 채로
+// 트랙을 멈추면 Chrome이 그 read에 주려고 만든 VideoFrame을 close 없이 버려 "garbage collected without being closed" 경고가 남.
+// (정상 중지는 handleStreamingRecordingStop이 세션을 먼저 stop하므로 dispose는 할 일이 없음)
+async function cleanup() {
   console.log('[Cleanup] 리소스 정리 시작');
   stopHeartbeat();
   isCapturing = false;
   resetPauseState();
+
+  const session = videoSession;
+  const mediaStream = stream;
+  const source = audioSource;
+  const context = audioContext;
+  videoSession = null;
+  stream = null;
+  audioSource = null;
+  audioContext = null;
+  streamingEncoder = null;
+  // 저장 위치 상태 (싱크는 이미 닫혔거나 시작 실패 경로에서 정리됨)
+  saveFolder = null;
+  audioOutput = null;
 
   if (audioWorkletNode) {
     try {
@@ -860,31 +878,27 @@ function cleanup() {
     audioWorkletNode = null;
   }
 
-  streamingEncoder = null;
-  videoSession = null;
-  // 저장 위치 상태 (싱크는 이미 닫혔거나 시작 실패 경로에서 정리됨)
-  saveFolder = null;
-  audioOutput = null;
-
-  if (audioSource) {
-    try { audioSource.disconnect(); } catch (error) { console.warn('[Cleanup] AudioSource 연결 해제 실패:', error); }
-    audioSource = null;
+  // 영상 세션 정리 → 그 뒤에 캡처 트랙 중지 (위 설명)
+  if (session) {
+    try { await session.dispose(); } catch (error) { console.warn('[Cleanup] 영상 세션 정리 실패:', error); }
   }
 
-  if (stream) {
+  if (source) {
+    try { source.disconnect(); } catch (error) { console.warn('[Cleanup] AudioSource 연결 해제 실패:', error); }
+  }
+
+  if (mediaStream) {
     try {
-      for (const track of stream.getTracks()) {
+      for (const track of mediaStream.getTracks()) {
         try { track.stop(); console.log('[Cleanup] 트랙 중지:', track.kind); } catch (e) { console.warn('[Cleanup] 트랙 중지 실패:', e); }
       }
     } catch (error) {
       console.warn('[Cleanup] getTracks() 호출 실패:', error);
     }
-    stream = null;
   }
 
-  if (audioContext && audioContext.state !== 'closed') {
-    audioContext.close().catch((error) => console.warn('[Cleanup] AudioContext 종료 실패:', error));
-    audioContext = null;
+  if (context && context.state !== 'closed') {
+    context.close().catch((error) => console.warn('[Cleanup] AudioContext 종료 실패:', error));
   }
 
   console.log('[Cleanup] ✓ 리소스 정리 완료');

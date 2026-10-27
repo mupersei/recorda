@@ -97,14 +97,15 @@ export function installFakeChrome({ streamId = 'stream-123', offscreenExists = f
   globalThis.chrome = chrome;
 
   /** 등록된 onMessage 리스너에 메시지를 보내고 sendResponse 결과를 기다림 */
-  const dispatch = (message) => new Promise((resolve) => {
+  // options.timeoutMs: 이 시간 안에 응답한 리스너가 없으면 undefined (기본 50ms. 응답이 늦게 오는 처리를 기다릴 때 늘림)
+  const dispatch = (message, { timeoutMs = 50 } = {}) => new Promise((resolve) => {
     let responded = false;
     for (const fn of listeners.onMessage) {
       const keep = fn(message, { id: 'fake' }, (response) => { responded = true; resolve(response); });
       if (keep === false && !responded) continue;
     }
     // 아무 리스너도 응답하지 않으면 undefined
-    setTimeout(() => { if (!responded) resolve(undefined); }, 50);
+    setTimeout(() => { if (!responded) resolve(undefined); }, timeoutMs);
   });
 
   const fireDownloadChanged = (delta) => {

@@ -880,3 +880,353 @@ test('VideoRecordingSession(mp4)은 영상 프레임이 없으면 NO_VIDEO로 �
   await assert.rejects(() => session.stop(), new RegExp(ERROR_MESSAGES.NO_VIDEO.slice(0, 8)));
   assert.deepEqual(userDir.fileNames(), []);
 });
+
+// ---- VideoFrame 수명 (누수 방지): 리더가 전달한 프레임은 모든 경로에서 정확히 한 번 close ----
+// 실측(헤드리스 Chrome 148): 대기 중 read가 있는 채로 리더를 cancel(또는 트랙 중지)하면 Chrome이 그 read에 주려고 이미 만든 VideoFrame이
+// 아무에게도 전달되지 않고 close 없이 버려져 "A VideoFrame was garbage collected without being closed" 경고가 납니다(중지마다 약 7%).
+// FakeReader의 inFlightOnCancel이 이 동작을 흉내 냅니다.
+
+/** 리더에 넘겨진 프레임이 모두 닫혔고(전달된 것은 인코더가), 전달 중 버려진 프레임이 없으며, 인코더 집계가 맞는지 */
+function assertAllFramesReleased(encoder, reader) {
+  assert.deepEqual(reader.unclosed().map(f => f.timestamp), [], '닫히지 않은 프레임 (리더에 넘겨진 것 전부)');
+  assert.ok(reader.delivered.every(f => f.closed && !f.discardedBySource), '리더가 전달한 프레임은 인코더가 닫음');
+  assert.deepEqual(reader.droppedInFlight, [], '대기 중 read가 있는 채로 cancel해 전달 중 버려진 프레임 없음');
+  assert.equal(encoder.stats.framesRead, reader.delivered.length, 'stats.framesRead = 리더가 전달한 프레임 수');
+  assert.equal(encoder.stats.framesClosed, encoder.stats.framesRead, 'stats.framesClosed = stats.framesRead');
+  assert.equal(encoder.stats.normalizedClosed, encoder.stats.normalizedCreated, '정규화로 만든 프레임도 모두 닫음');
+}
+
+/** 30fps로 프레임이 오는 화면 흉내: 가짜 시계를 33ms씩 움직이며 프레임을 하나씩 전달 */
+async function feedAtCadence(reader, setClock, count, { startIndex = 0 } = {}) {
+  for (let i = startIndex; i < startIndex + count; i++) {
+    setClock(i * 33);
+    reader.push(new FakeVideoFrame({ timestamp: i * FRAME_US }));
+    await tick();
+  }
+}
+
+test('VideoTrackEncoder는 정상 중지에서 리더가 전달한 모든 프레임을 닫고 stats(framesRead = framesClosed = framesEncoded)를 보고한다', async () => {
+  const { encoder, reader } = makeEncoder({ frameList: frames(5) });
+  await encoder.start();
+  await tick();
+  await encoder.stop();
+  assertAllFramesReleased(encoder, reader);
+  assert.equal(encoder.stats.framesRead, 5);
+  assert.equal(encoder.stats.framesEncoded, 5);
+  assert.equal(encoder.stats.framesAfterStop, 0);
+});
+
+test('VideoTrackEncoder.stop()은 프레임이 오던 중이면 대기 중 read가 다음 프레임을 받을 때까지 기다려 그 프레임을 인코딩하지 않고 닫은 뒤, 대기 read 없이 리더를 cancel한다 (Chrome이 전달 중이던 프레임을 버리지 않게)', async () => {
+  let clock = 0;
+  const reader = new FakeReader([], { inFlightOnCancel: true });
+  const { FakeVideoEncoder, instances } = makeFakeVideoEncoder();
+  const encoder = new VideoTrackEncoder({ track: {}, deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => clock } });
+  await encoder.start();
+  await feedAtCadence(reader, (t) => { clock = t; }, 4); // 0, 33, 66, 99 ms
+  clock = 110;
+  const t0 = Date.now();
+  const stopping = encoder.stop();
+  setTimeout(() => { clock = 132; reader.push(new FakeVideoFrame({ timestamp: 4 * FRAME_US })); }, 15); // 중지 요청 뒤 도착한 다음 프레임
+  await stopping;
+  assert.equal(reader.pendingReadsAtCancel, 0, '대기 중 read 없이 cancel');
+  assert.equal(encoder.stats.cancelledWithPendingRead, false);
+  assert.equal(instances[0].encoded.length, 4, '중지 요청 뒤 받은 프레임은 인코딩하지 않음');
+  assert.equal(encoder.stats.framesAfterStop, 1);
+  assertAllFramesReleased(encoder, reader);
+  assert.ok(Date.now() - t0 < 150, `다음 프레임이 오면 바로 끝남 (${Date.now() - t0} ms)`);
+  assert.ok(instances[0].flushed && instances[0].closed);
+});
+
+test('VideoTrackEncoder.stop()은 첫 프레임이 오기 전에 중지되면(시작 직후 중지) 전달 중일 수 있는 첫 프레임을 받아 닫은 뒤 cancel한다', async () => {
+  const reader = new FakeReader([], { inFlightOnCancel: true });
+  const { FakeVideoEncoder, instances } = makeFakeVideoEncoder();
+  const encoder = new VideoTrackEncoder({ track: {}, deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => 0 } });
+  await encoder.start();
+  const stopping = encoder.stop();
+  setTimeout(() => reader.push(new FakeVideoFrame({ timestamp: 0 })), 20);
+  await stopping;
+  assert.equal(reader.pendingReadsAtCancel, 0);
+  assert.equal(instances[0].encodeCalls || 0, 0, '중지 뒤 받은 첫 프레임은 인코딩하지 않음 (인코더 설정도 안 함)');
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder.stop()은 화면 변화가 없어 프레임이 끊긴 경우(전달 중인 프레임 없음) 기다리지 않고 바로 cancel한다', async () => {
+  let clock = 0;
+  const reader = new FakeReader([]);
+  const { FakeVideoEncoder } = makeFakeVideoEncoder();
+  const encoder = new VideoTrackEncoder({ track: {}, deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => clock } });
+  await encoder.start();
+  await feedAtCadence(reader, (t) => { clock = t; }, 3);
+  clock = 5_000; // 5초 동안 프레임 없음
+  const t0 = Date.now();
+  await encoder.stop();
+  assert.ok(Date.now() - t0 < 50, `정적인 화면에서는 중지 지연 없음 (${Date.now() - t0} ms)`);
+  assert.equal(reader.pendingReadsAtCancel, 1);
+  assert.equal(encoder.stats.cancelledWithPendingRead, true, '진단: 대기 read가 남은 채 cancel (전달 중인 프레임이 없을 때만)');
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder.stop()은 다음 프레임이 상한(STOP_DRAIN_TIMEOUT_MS) 안에 오지 않으면 더 기다리지 않고 cancel한다', async () => {
+  let clock = 0;
+  const reader = new FakeReader([]);
+  const { FakeVideoEncoder } = makeFakeVideoEncoder();
+  const encoder = new VideoTrackEncoder({
+    track: {}, settings: { ...VIDEO_SETTINGS, STOP_DRAIN_TIMEOUT_MS: 30 },
+    deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => clock }
+  });
+  await encoder.start();
+  await feedAtCadence(reader, (t) => { clock = t; }, 4);
+  clock = 110;
+  const t0 = Date.now();
+  await encoder.stop();
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed >= 25 && elapsed < 200, `상한만큼만 기다림 (${elapsed} ms)`);
+  assert.equal(reader.pendingReadsAtCancel, 1);
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder는 중지가 요청된 뒤 리더에 쌓이거나(푸시) 대기 read로 전달된 프레임을 인코딩하지 않고 모두 닫는다', async () => {
+  const { encoder, reader, instances } = makeEncoder({ frameList: frames(3) });
+  await encoder.start();
+  await tick();
+  const late = [3, 4, 5].map(i => new FakeVideoFrame({ timestamp: i * FRAME_US }));
+  reader.push(late[0]);          // 대기 중 read로 전달 (루프가 처리하기 전)
+  reader.push(late[1]);          // 리더에 쌓임
+  const stopping = encoder.stop(); // 루프가 late[0]을 처리하기 전에 중지 요청
+  reader.push(late[2]);          // 중지 요청 뒤 도착
+  await stopping;
+  assert.equal(instances[0].encoded.length, 3, '중지 요청 뒤 받은 프레임은 인코딩하지 않음');
+  assert.ok(late.every(f => f.closed), '늦게 온 프레임도 모두 닫힘');
+  assert.equal(encoder.stats.framesAfterStop, 1);
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder는 encode()가 동기 예외를 던지면(닫힌 코덱 등) 그 프레임을 닫고, 이후 프레임도 계속 읽어 인코딩 없이 닫으며 stop()은 영상 인코딩 실패로 거부된다', async () => {
+  const reader = new FakeReader(frames(3));
+  const { FakeVideoEncoder, instances } = makeFakeVideoEncoder({ throwOnEncodeAt: 1 });
+  const encoder = new VideoTrackEncoder({ track: {}, deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => 0 } });
+  await encoder.start();
+  await tick();
+  for (let i = 3; i < 8; i++) reader.push(new FakeVideoFrame({ timestamp: i * FRAME_US }));
+  await tick();
+  assert.equal(encoder.stats.framesRead, 8, '예외 뒤에도 트랙을 계속 읽어 닫음 (읽기를 멈추지 않음)');
+  assert.equal(instances[0].encodeCalls, 2, '예외 뒤에는 encode를 다시 부르지 않음');
+  await assert.rejects(() => encoder.stop(), new RegExp(ERROR_MESSAGES.VIDEO_ENCODING_FAILED));
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder는 첫 프레임에서 configure()가 동기 예외를 던지면 그 프레임과 이후 프레임을 모두 닫고 stop()은 실패를 알린다', async () => {
+  const reader = new FakeReader(frames(2));
+  const { FakeVideoEncoder, instances } = makeFakeVideoEncoder({ throwOnConfigure: true });
+  const encoder = new VideoTrackEncoder({ track: {}, deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => 0 } });
+  await encoder.start();
+  await tick();
+  for (let i = 2; i < 5; i++) reader.push(new FakeVideoFrame({ timestamp: i * FRAME_US }));
+  await tick();
+  assert.equal(encoder.stats.framesRead, 5);
+  assert.equal(instances[0].encodeCalls || 0, 0);
+  await assert.rejects(() => encoder.stop(), /가짜 configure 실패/);
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder는 인코더 오류(error 콜백) 뒤에 온 프레임을 인코딩하지 않고 닫는다', async () => {
+  const reader = new FakeReader(frames(6));
+  const { FakeVideoEncoder, instances } = makeFakeVideoEncoder({ failOn: 2 });
+  const encoder = new VideoTrackEncoder({ track: {}, deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => 0 } });
+  await encoder.start();
+  await tick();
+  assert.equal(instances[0].encoded.length, 2);
+  await assert.rejects(() => encoder.stop(), /가짜 인코더 오류/);
+  assertAllFramesReleased(encoder, reader);
+  assert.equal(encoder.stats.framesRead, 6);
+});
+
+function makeNormalizingEncoder({ VideoFrameCtor, drawImage, encoderOptions = {} }) {
+  const list = [new FakeVideoFrame({ timestamp: 0, width: 1280, height: 720 }), new FakeVideoFrame({ timestamp: 33_333, width: 640, height: 480 }), new FakeVideoFrame({ timestamp: 66_666, width: 640, height: 480 })];
+  class FakeCanvas {
+    constructor(w, h) { this.width = w; this.height = h; }
+    getContext() { return { fillRect() {}, drawImage: drawImage || (() => {}), fillStyle: '' }; }
+  }
+  const reader = new FakeReader(list);
+  const { FakeVideoEncoder, instances } = makeFakeVideoEncoder(encoderOptions);
+  const encoder = new VideoTrackEncoder({
+    track: {},
+    deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => 0, OffscreenCanvas: FakeCanvas, VideoFrame: VideoFrameCtor }
+  });
+  return { encoder, reader, instances, list };
+}
+class ClosableCanvasFrame {
+  static created = [];
+  constructor(canvas, init) { this.timestamp = init.timestamp; this.displayWidth = canvas.width; this.displayHeight = canvas.height; this.codedWidth = canvas.width; this.codedHeight = canvas.height; this.closed = false; ClosableCanvasFrame.created.push(this); }
+  close() { this.closed = true; }
+}
+
+test('VideoTrackEncoder 정규화: new VideoFrame(canvas)가 실패하면 원본 프레임으로 인코딩하고 모든 프레임을 닫는다 (정규화 프레임 없음)', async () => {
+  class ThrowingCtor { constructor() { throw new Error('가짜 VideoFrame 생성 실패'); } }
+  const { encoder, reader, instances } = makeNormalizingEncoder({ VideoFrameCtor: ThrowingCtor });
+  await encoder.start();
+  await tick();
+  await encoder.stop();
+  assert.equal(instances[0].encoded.length, 3, '원본으로 인코딩 (인코더 스케일링)');
+  assert.equal(encoder.stats.normalizedCreated, 0);
+  assert.equal(encoder.normalizedFrames, 0, '만들지 못한 정규화 프레임은 세지 않음');
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder 정규화: drawImage가 실패하면 정규화 프레임을 만들지 않고 원본으로 인코딩한다 (그리기가 끝난 뒤에만 VideoFrame 생성)', async () => {
+  ClosableCanvasFrame.created = [];
+  const { encoder, reader, instances } = makeNormalizingEncoder({ VideoFrameCtor: ClosableCanvasFrame, drawImage: () => { throw new Error('가짜 drawImage 실패'); } });
+  await encoder.start();
+  await tick();
+  await encoder.stop();
+  assert.equal(ClosableCanvasFrame.created.length, 0);
+  assert.equal(instances[0].encoded.length, 3);
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder 정규화: encode()가 정규화 프레임에서 동기 예외를 던지면 원본과 정규화 프레임을 모두 닫는다', async () => {
+  ClosableCanvasFrame.created = [];
+  const { encoder, reader } = makeNormalizingEncoder({ VideoFrameCtor: ClosableCanvasFrame, encoderOptions: { throwOnEncodeAt: 1 } });
+  await encoder.start();
+  await tick();
+  await assert.rejects(() => encoder.stop(), new RegExp(ERROR_MESSAGES.VIDEO_ENCODING_FAILED));
+  assert.equal(ClosableCanvasFrame.created.length, 1, '예외가 난 두 번째 프레임만 정규화 (세 번째는 인코더 오류로 인코딩 안 함)');
+  assert.ok(ClosableCanvasFrame.created.every(f => f.closed), '정규화 프레임 닫힘');
+  assert.equal(encoder.stats.normalizedCreated, 1);
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder 정규화: 비율이 바뀐 프레임마다 만든 정규화 프레임을 encode 뒤 닫는다 (stats.normalizedCreated = normalizedClosed)', async () => {
+  ClosableCanvasFrame.created = [];
+  const { encoder, reader, instances } = makeNormalizingEncoder({ VideoFrameCtor: ClosableCanvasFrame });
+  await encoder.start();
+  await tick();
+  await encoder.stop();
+  assert.equal(instances[0].encoded.length, 3);
+  assert.equal(ClosableCanvasFrame.created.length, 2);
+  assert.equal(encoder.stats.normalizedCreated, 2);
+  assert.equal(encoder.normalizedFrames, 2);
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder 일시정지: 일시정지 중 프레임과 pause() 직후(루프가 처리하기 전) 전달된 프레임은 인코딩하지 않고 닫으며, 재개 후 프레임은 인코딩한다', async () => {
+  const { encoder, reader, instances } = makeEncoder({ frameList: frames(3) });
+  await encoder.start();
+  await tick();
+  const justAfterPause = new FakeVideoFrame({ timestamp: 3 * FRAME_US });
+  reader.push(justAfterPause); // 대기 read로 전달됐지만 루프가 처리하기 전
+  encoder.pause();
+  for (let i = 4; i < 9; i++) reader.push(new FakeVideoFrame({ timestamp: i * FRAME_US }));
+  await tick();
+  encoder.resume();
+  for (let i = 9; i < 11; i++) reader.push(new FakeVideoFrame({ timestamp: i * FRAME_US }));
+  await tick();
+  await encoder.stop();
+  assert.equal(instances[0].encoded.length, 5, '일시정지 전 3 + 재개 후 2');
+  assert.equal(encoder.pausedFrames, 6, 'pause() 직후 전달된 프레임 포함');
+  assert.ok(justAfterPause.closed);
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder.dispose()는 (시작 실패 정리) 리더를 끝내고 인코더를 닫으며 이후 프레임을 인코딩하지 않고, 여러 번 불러도 안전하다', async () => {
+  const { encoder, reader, instances } = makeEncoder({ frameList: frames(3) });
+  await encoder.start();
+  await tick();
+  await encoder.dispose();
+  assert.equal(reader.cancelled, true);
+  assert.equal(instances[0].closed, true);
+  reader.push(new FakeVideoFrame({ timestamp: 9 * FRAME_US })); // 정리 뒤 소스가 낸 프레임 (리더 취소됨)
+  await encoder.dispose();
+  await tick();
+  assert.equal(instances[0].encoded.length, 3);
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder.dispose()도 프레임이 오던 중이면 대기 read가 다음 프레임을 받을 때까지 기다린 뒤 cancel한다', async () => {
+  let clock = 0;
+  const reader = new FakeReader([], { inFlightOnCancel: true });
+  const { FakeVideoEncoder, instances } = makeFakeVideoEncoder();
+  const encoder = new VideoTrackEncoder({ track: {}, deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => clock } });
+  await encoder.start();
+  await feedAtCadence(reader, (t) => { clock = t; }, 3);
+  clock = 80;
+  const disposing = encoder.dispose();
+  setTimeout(() => { clock = 99; reader.push(new FakeVideoFrame({ timestamp: 3 * FRAME_US })); }, 10);
+  await disposing;
+  assert.equal(reader.pendingReadsAtCancel, 0);
+  assert.equal(instances[0].closed, true);
+  assertAllFramesReleased(encoder, reader);
+});
+
+test('VideoTrackEncoder.stop()이 start() 도중(코덱 조회 중)에 불리면 인코더·프로세서를 만들지 않는다 (트랙 읽기 시작 안 함)', async () => {
+  const reader = new FakeReader(frames(3));
+  const { FakeVideoEncoder, instances } = makeFakeVideoEncoder();
+  let releaseProbe;
+  const gate = new Promise(r => { releaseProbe = r; });
+  class SlowProbeEncoder extends FakeVideoEncoder {
+    static async isConfigSupported(config) { await gate; return { supported: true, config }; }
+  }
+  let processors = 0;
+  class CountingProcessor { constructor() { processors++; this.readable = { getReader: () => reader }; } }
+  const encoder = new VideoTrackEncoder({ track: {}, deps: { VideoEncoder: SlowProbeEncoder, MediaStreamTrackProcessor: CountingProcessor, now: () => 0 } });
+  const starting = encoder.start();
+  const stopping = encoder.stop();
+  releaseProbe();
+  await starting;
+  await stopping;
+  assert.equal(processors, 0, '프로세서(트랙 읽기)를 만들지 않음');
+  assert.equal(instances.length, 0, 'VideoEncoder를 만들지 않음');
+  assert.equal(reader.readCalls, 0);
+});
+
+test('VideoRecordingSession.dispose()는 시작한 뒤 중지하지 않은 세션(시작 실패 정리)의 리더를 끝내고 인코더를 닫으며 폴더에 쓰다 만 결과 파일을 지운다 (여러 번 불러도 안전)', async () => {
+  const userDir = new FakeDirectoryHandle('Recordings');
+  const { session, reader } = await startDirectSession({
+    format: 'mp4',
+    outputSinkFactory: async (fmt, mimeType) => { const sink = new DirectoryFileSink(userDir, 'recorda_d.mp4', mimeType); await sink.open(); return sink; }
+  });
+  assert.deepEqual(userDir.fileNames(), ['recorda_d.mp4'], '시작 때 만든 결과 파일');
+  await session.dispose();
+  assert.equal(reader.cancelled, true);
+  assert.equal(session.videoEncoder.encoder.state, 'closed');
+  assert.deepEqual(userDir.fileNames(), [], '쓰다 만 결과 파일 삭제');
+  assertAllFramesReleased(session.videoEncoder, reader);
+  await session.dispose();
+});
+
+test('VideoRecordingSession.dispose()는 정상 stop() 뒤에는 결과 파일을 건드리지 않고, stop() 진행 중에 불리면 그 결과를 기다린다', async () => {
+  const userDir = new FakeDirectoryHandle('Recordings');
+  const { session, reader } = await startDirectSession({
+    format: 'fmp4',
+    outputSinkFactory: async (fmt, mimeType) => { const sink = new DirectoryFileSink(userDir, 'recorda_k.mp4', mimeType); await sink.open(); return sink; }
+  });
+  const stopping = session.stop();
+  const disposing = session.dispose(); // 중지 진행 중 정리 요청 (예: 다른 경로의 cleanup)
+  const blob = await stopping;
+  await disposing;
+  assert.ok(blob.size > 0);
+  assert.deepEqual(userDir.fileNames(), ['recorda_k.mp4'], '완성된 파일은 그대로');
+  assert.equal(session.stats.frameStats.framesRead, session.stats.frameStats.framesClosed, '세션 통계에 프레임 집계 포함');
+  assertAllFramesReleased(session.videoEncoder, reader);
+});
+
+test('VideoRecordingSession.dispose()가 start() 도중(결과 파일을 여는 중)에 불리면 시작을 중단하고 열린 결과 파일을 지우며 트랙 읽기를 시작하지 않는다', async () => {
+  const userDir = new FakeDirectoryHandle('Recordings');
+  let releaseSink;
+  const gate = new Promise(r => { releaseSink = r; });
+  const reader = new FakeReader(frames(3));
+  const { FakeVideoEncoder, instances } = makeFakeVideoEncoder();
+  const session = new VideoRecordingSession({
+    format: 'mp4', videoTrack: {}, sampleRate: 44100, bitrateKbps: 128,
+    outputSinkFactory: async (fmt, mimeType) => { await gate; const sink = new DirectoryFileSink(userDir, 'recorda_s.mp4', mimeType); await sink.open(); return sink; },
+    deps: { VideoEncoder: FakeVideoEncoder, MediaStreamTrackProcessor: makeFakeTrackProcessor(reader), now: () => 0 }
+  });
+  const starting = session.start();
+  const disposing = session.dispose();
+  releaseSink();
+  await assert.rejects(() => starting, /정리/);
+  await disposing;
+  assert.deepEqual(userDir.fileNames(), [], '시작 중 열린 결과 파일 정리');
+  assert.equal(instances.length, 0, '인코더를 만들지 않음');
+  assert.equal(reader.readCalls, 0, '트랙을 읽지 않음');
+});

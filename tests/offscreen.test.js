@@ -81,6 +81,21 @@ before(async () => {
   await import('../offscreen.js');
 });
 
+/**
+ * STOP_CAPTURE를 보내고 중지 처리가 끝날 때까지 대기: 보낸 뒤 새 RECORDING_COMPLETE / RECORDING_ERROR가 나올 때까지(최대 3초) 기다리고,
+ * 그다음 기존 여유 시간(settleMs)만큼 더 기다림. 영상 세션은 중지 때 대기 중 read가 전달 중인 프레임을 받을 때까지 최대
+ * VIDEO_SETTINGS.STOP_DRAIN_TIMEOUT_MS 기다리므로(Chrome VideoFrame 누수 방지) 고정 대기만으로는 완료 시점을 보장할 수 없음
+ */
+async function stopCapture(settleMs = 0, timeoutMs = 3000) {
+  const endings = () => fake.calls.sendMessage.filter(m => m.action === MESSAGE_TYPES.RECORDING_COMPLETE || m.action === MESSAGE_TYPES.RECORDING_ERROR).length;
+  const before = endings();
+  const response = await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
+  const deadline = Date.now() + timeoutMs;
+  while (endings() <= before && Date.now() < deadline) await flush(10);
+  await flush(settleMs);
+  return response;
+}
+
 let videoEncoderInstances = [];
 function installVideoFakes(frameCount = 8, stepUs = 33_333) {
   frameReader = new FakeReader(Array.from({ length: frameCount }, (_, i) => new FakeVideoFrame({ timestamp: i * stepUs })));
@@ -120,9 +135,8 @@ test('START_CAPTURE(VIDEO_AUDIO_SPLIT, mp4+mp3) → 영상 제약 포함 getUser
   await flush();
 
   fake.calls.sendMessage.length = 0;
-  const stopRes = await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
+  const stopRes = await stopCapture(200);
   assert.equal(stopRes.success, true);
-  await flush(200);
 
   const downloads = fake.calls.sendMessage.filter(m => m.action === MESSAGE_TYPES.DOWNLOAD_FILE);
   assert.equal(downloads.length, 2, JSON.stringify(fake.calls.sendMessage.map(m => m.action)));
@@ -149,8 +163,7 @@ test('START_CAPTURE(AUDIO_ONLY) → 영상 제약 없이 캡처하고 오디오 
 
   feedAudio(6);
   fake.calls.sendMessage.length = 0;
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(200);
+  await stopCapture(200);
 
   const downloads = fake.calls.sendMessage.filter(m => m.action === MESSAGE_TYPES.DOWNLOAD_FILE);
   assert.equal(downloads.length, 1);
@@ -169,8 +182,7 @@ test('START_CAPTURE(VIDEO_AUDIO, avi) → 영상 파일 1개만 저장한다', a
 
   feedAudio(4);
   fake.calls.sendMessage.length = 0;
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(200);
+  await stopCapture(200);
 
   const downloads = fake.calls.sendMessage.filter(m => m.action === MESSAGE_TYPES.DOWNLOAD_FILE);
   assert.equal(downloads.length, 1);
@@ -209,8 +221,7 @@ test('chrome.downloads가 실패하면 앵커 다운로드로 폴백하고 녹�
     assert.equal(res.success, true, res.error);
     feedAudio(3);
     fake.calls.sendMessage.length = 0;
-    await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-    await flush(1300);
+    await stopCapture(1300);
     assert.equal(anchors.length, 1);
     assert.match(anchors[0], /\.mov$/);
     assert.ok(fake.calls.sendMessage.some(m => m.action === MESSAGE_TYPES.RECORDING_COMPLETE));
@@ -229,8 +240,7 @@ test('분리 저장 모드에서 영상 프레임이 0개라 머싱이 실패해
 
   feedAudio(4);
   fake.calls.sendMessage.length = 0;
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(200);
+  await stopCapture(200);
 
   const downloads = fake.calls.sendMessage.filter(m => m.action === MESSAGE_TYPES.DOWNLOAD_FILE);
   assert.equal(downloads.length, 1);
@@ -250,8 +260,7 @@ test('영상 단독 모드에서 머싱이 실패하면 RECORDING_ERROR를 보�
   assert.equal(res.success, true, res.error);
 
   fake.calls.sendMessage.length = 0;
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(200);
+  await stopCapture(200);
 
   assert.ok(fake.calls.sendMessage.some(m => m.action === MESSAGE_TYPES.RECORDING_ERROR));
   assert.ok(!fake.calls.sendMessage.some(m => m.action === MESSAGE_TYPES.RECORDING_COMPLETE));
@@ -266,8 +275,7 @@ test('AudioContext는 사용자 설정 샘플레이트로 생성된다 (루프�
   assert.ok(globalThis.__audioContextOpts.length >= 1);
   assert.ok(globalThis.__audioContextOpts.every(o => o && o.sampleRate === 48000), JSON.stringify(globalThis.__audioContextOpts));
   feedAudio(2);
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(200);
+  await stopCapture(200);
 });
 
 test('녹화 중 캡처 트랙이 끝나면(탭 닫힘) 스스로 중지하고 파일을 저장한다', async () => {
@@ -295,8 +303,7 @@ test('중지 시 워크릿의 마지막 플러시(stopped 응답)를 기다린 �
   feedAudio(3);
   const port = workletPorts[0];
   port.ackOnStop = true;
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(300);
+  await stopCapture(300);
   assert.equal(port.deliveredWhileAttached, true, 'stop 이후 보낸 마지막 오디오/stopped 메시지가 onmessage가 붙어 있는 동안 전달되어야 함');
 });
 
@@ -311,8 +318,7 @@ test('녹화 중 주기적으로 RECORDING_HEARTBEAT(tabId, startTime, plan)를 
   assert.equal(beats[0].data.tabId, 77);
   assert.equal(beats[0].data.startTime, 123456);
   assert.equal(beats[0].data.plan.mode, RECORDING_MODES.AUDIO_ONLY);
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(300);
+  await stopCapture(300);
   const count = fake.calls.sendMessage.filter(m => m.action === MESSAGE_TYPES.RECORDING_HEARTBEAT).length;
   await flush(150);
   assert.equal(fake.calls.sendMessage.filter(m => m.action === MESSAGE_TYPES.RECORDING_HEARTBEAT).length, count, '중지 후에는 하트비트 중단');
@@ -331,8 +337,7 @@ test('OPFS가 있으면 녹화 데이터를 디스크(세션 디렉토리)에 �
   assert.equal(res.success, true, res.error);
   feedAudio(4);
   fake.calls.sendMessage.length = 0;
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(300);
+  await stopCapture(300);
 
   const complete = fake.calls.sendMessage.find(m => m.action === MESSAGE_TYPES.RECORDING_COMPLETE);
   assert.ok(complete, 'RECORDING_COMPLETE');
@@ -362,8 +367,7 @@ test('OPFS가 있으면 녹화 데이터를 디스크(세션 디렉토리)에 �
   assert.equal(after.length, 1, '이전 세션 삭제, 현재 세션만');
   assert.notEqual(after[0], sessions[0]);
   feedAudio(2);
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(300);
+  await stopCapture(300);
   delete globalThis.navigator.storage;
 });
 
@@ -375,8 +379,7 @@ test('RECORDING_COMPLETE는 중지 후 단계별 소요 시간(timings)을 함�
   assert.equal(res.success, true, res.error);
   feedAudio(3);
   fake.calls.sendMessage.length = 0;
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(300);
+  await stopCapture(300);
   const complete = fake.calls.sendMessage.find(m => m.action === MESSAGE_TYPES.RECORDING_COMPLETE);
   assert.ok(complete, 'RECORDING_COMPLETE');
   const t = complete.data.timings;
@@ -457,8 +460,7 @@ test('PAUSE_CAPTURE 중에는 오디오 파일 인코더와 영상 세션 어디
     await flush();
 
     fake.calls.sendMessage.length = 0;
-    await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-    await flush(300);
+    await stopCapture(300);
 
     for (const enc of ['wav', 'container']) {
       assert.deepEqual(spy.values(enc), [0.25, 0.25, 0.5, 0.125, 0.125, 0], `${enc}: 일시정지 전 + 경계 꼬리 + 재개 후 + 중지 꼬리만 전달`);
@@ -492,8 +494,7 @@ test('워크릿이 paused 응답을 보내지 않아도 잠시 뒤에는 일시�
     await flush(450);         // 응답 대기 타임아웃 경과
     feedAudioValue(1, 0.75);  // 일시정지 중 → 버림
     fake.calls.sendMessage.length = 0;
-    await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-    await flush(300);
+    await stopCapture(300);
     assert.deepEqual(spy.values('wav'), [0.25, 0.5], '타임아웃 뒤의 PCM과 일시정지 중 중지 꼬리는 기록하지 않음');
     assert.ok(fake.calls.sendMessage.some(m => m.action === MESSAGE_TYPES.RECORDING_COMPLETE));
   } finally {
@@ -513,9 +514,8 @@ test('일시정지 중 STOP_CAPTURE는 정상적으로 파일을 마무리한다
   await flush();
   frameReader.push(new FakeVideoFrame({ timestamp: 10 * 33_333 }));
   fake.calls.sendMessage.length = 0;
-  const stop = await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
+  const stop = await stopCapture(300);
   assert.equal(stop.success, true);
-  await flush(300);
   const complete = fake.calls.sendMessage.find(m => m.action === MESSAGE_TYPES.RECORDING_COMPLETE);
   assert.ok(complete, 'RECORDING_COMPLETE 전송');
   assert.deepEqual(complete.data.files.map(f => f.format), ['mp4', 'mp3']);
@@ -557,8 +557,7 @@ test('RECORDING_HEARTBEAT는 일시정지 상태(paused, pausedAt, pausedTotalMs
   assert.equal(beat.data.pausedAt, null);
   assert.equal(beat.data.pausedTotalMs, 4000);
 
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(300);
+  await stopCapture(300);
 });
 
 test('PAUSE_CAPTURE / RESUME_CAPTURE를 중복으로 받아도 워크릿에 명령을 한 번만 보내고 성공으로 응답한다', async () => {
@@ -575,8 +574,7 @@ test('PAUSE_CAPTURE / RESUME_CAPTURE를 중복으로 받아도 워크릿에 명�
   assert.equal((await fake.dispatch({ action: MESSAGE_TYPES.RESUME_CAPTURE, data: { pausedTotalMs: 10 } })).success, true);
   assert.equal((await fake.dispatch({ action: MESSAGE_TYPES.RESUME_CAPTURE, data: { pausedTotalMs: 10 } })).success, true);
   assert.deepEqual(commands(), ['pause', 'resume']);
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(300);
+  await stopCapture(300);
 });
 
 // ---- 사용자 폴더 직접 저장 (START_CAPTURE saveToFolder) ----
@@ -614,8 +612,7 @@ async function recordToFolder({ plan, audioFormat, chunks = 4, startTime = LOCAL
   await flush();
   if (between) await between();
   fake.calls.sendMessage.length = 0;
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(300);
+  await stopCapture(300);
   return sentOf(MESSAGE_TYPES.RECORDING_COMPLETE)[0];
 }
 
@@ -823,8 +820,7 @@ test('fMP4(다운로드 저장): 파일명은 .mp4, RECORDING_COMPLETE에는 for
   assert.equal(res.success, true, res.error);
   feedAudio(3);
   fake.calls.sendMessage.length = 0;
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(300);
+  await stopCapture(300);
   assert.deepEqual(sentOf(MESSAGE_TYPES.DOWNLOAD_FILE).map(d => [d.data.filename, d.data.format]), [[`${BASE}.mp4`, 'fmp4']]);
   const complete = sentOf(MESSAGE_TYPES.RECORDING_COMPLETE)[0];
   assert.deepEqual(complete.data.files.map(f => [f.format, f.label, f.filename]), [['fmp4', 'MP4', `${BASE}.mp4`]]);
@@ -970,11 +966,103 @@ test('saveToFolder가 없으면(기본) 파일명도 녹화 시작 시각 기준
   assert.equal(res.success, true, res.error);
   feedAudio(2);
   fake.calls.sendMessage.length = 0;
-  await fake.dispatch({ action: MESSAGE_TYPES.STOP_CAPTURE });
-  await flush(300);
+  await stopCapture(300);
   assert.deepEqual(sentOf(MESSAGE_TYPES.DOWNLOAD_FILE).map(d => d.data.filename), [`${BASE}.mp3`]);
   const complete = sentOf(MESSAGE_TYPES.RECORDING_COMPLETE)[0];
   assert.equal(complete.data.savedTo, 'downloads');
   assert.deepEqual(complete.data.files.map(f => [f.savedTo, f.location]), [['downloads', null]]);
   assert.equal(complete.data.warning, undefined);
+});
+
+// ---- 정리 순서와 VideoFrame 수명 (누수 방지) ----
+import { VideoRecordingSession } from '../video-recorder.js';
+
+/** 캡처 트랙의 stop() 시점에 리더가 이미 끝났는지(cancel) 기록하는 getUserMedia */
+function useStopOrderStream(reader) {
+  const original = globalThis.navigator.mediaDevices.getUserMedia;
+  const stops = [];
+  globalThis.navigator.mediaDevices.getUserMedia = async (constraints) => {
+    lastConstraints = constraints;
+    const s = makeStream({ withVideo: !!constraints.video });
+    for (const t of s.getTracks()) {
+      t.stop = () => stops.push({ kind: t.kind, readerCancelled: reader.cancelled, pendingReads: reader.pendingReads, encodersClosed: videoEncoderInstances.every(e => e.closed) });
+    }
+    return s;
+  };
+  return { stops, restore: () => { globalThis.navigator.mediaDevices.getUserMedia = original; } };
+}
+
+/** offscreen.js와 같은 모듈 인스턴스의 VideoRecordingSession.dispose 호출 기록 */
+function spySessionDispose() {
+  const calls = [];
+  const original = VideoRecordingSession.prototype.dispose;
+  VideoRecordingSession.prototype.dispose = function (...args) {
+    calls.push({ format: this.format, finished: this.finished });
+    return original ? original.apply(this, args) : undefined;
+  };
+  return { calls, restore: () => { VideoRecordingSession.prototype.dispose = original; } };
+}
+
+test('시작 도중 실패(세션이 프레임을 읽기 시작한 뒤 RECORDING_STARTED 전송 실패)로 정리할 때 영상 세션을 정리한다: 캡처 트랙을 멈추기 전에 리더를 끝내고, 인코더를 닫고, 폴더에 미리 만든 영상 파일을 지우며, 읽은 프레임을 모두 닫는다', async () => {
+  const userDir = new FakeDirectoryHandle('Recordings');
+  await useSaveFolder(userDir);
+  installVideoFakes(4);
+  const reader = frameReader;
+  reader.inFlightOnCancel = true; // Chrome 흉내: 대기 read가 있는 채로 cancel하면 전달 중이던 프레임이 close 없이 버려짐
+  const order = useStopOrderStream(reader);
+  const dispose = spySessionDispose();
+  fake.chrome.__respondTo[MESSAGE_TYPES.RECORDING_STARTED] = async () => {
+    // 세션이 실제 간격으로 오는 프레임을 읽는 중에 시작이 실패하고, 정리하는 동안 다음 프레임이 도착
+    for (let i = 4; i < 7; i++) { await flush(12); reader.push(new FakeVideoFrame({ timestamp: i * 33_333 })); }
+    setTimeout(() => reader.push(new FakeVideoFrame({ timestamp: 7 * 33_333 })), 30);
+    throw new Error('Could not establish connection. Receiving end does not exist.');
+  };
+  try {
+    workletPorts = [];
+    fake.calls.sendMessage.length = 0;
+    const plan = resolveRecordingPlan({ mode: RECORDING_MODES.VIDEO_AUDIO, videoFormat: 'mp4' });
+    // 시작 실패 응답은 정리(세션 dispose: 전달 중인 프레임을 기다릴 수 있음)가 끝난 뒤에 오므로 기본 50ms보다 길게 기다림
+    const res = await fake.dispatch({ action: MESSAGE_TYPES.START_CAPTURE, data: { streamId: 'sf', bitrate: 128, sampleRate: 44100, plan, startTime: LOCAL_START, saveToFolder: true } }, { timeoutMs: 3000 });
+    assert.ok(res, '시작 응답 (정리 후)');
+    assert.equal(res.success, false, '시작 실패 응답');
+    await flush(100);
+    assert.ok(sentOf(MESSAGE_TYPES.RECORDING_ERROR).length >= 1, 'RECORDING_ERROR');
+    assert.equal(dispose.calls.length, 1, 'cleanup이 영상 세션을 dispose (참조만 버리지 않음)');
+    assert.equal(reader.cancelled, true, '영상 리더 취소');
+    assert.equal(reader.pendingReadsAtCancel, 0, '정리 중 도착한 프레임을 받아 닫은 뒤 대기 read 없이 cancel');
+    assert.deepEqual(reader.droppedInFlight, []);
+    assert.ok(videoEncoderInstances.length === 1 && videoEncoderInstances[0].closed, '인코더 닫음');
+    assert.deepEqual(reader.unclosed(), [], '세션이 읽은 프레임은 모두 닫힘');
+    assert.ok(reader.delivered.length >= 4);
+    const videoStop = order.stops.find(s => s.kind === 'video');
+    assert.ok(videoStop, '캡처 트랙 중지');
+    assert.equal(videoStop.readerCancelled, true, '리더를 먼저 끝낸 뒤 캡처 트랙을 멈춤 (대기 read가 있는 채로 트랙을 멈추면 Chrome이 전달 중이던 프레임을 버림)');
+    assert.deepEqual(userDir.fileNames(), [], '폴더에 미리 만든(쓰다 만) 영상 파일 정리');
+  } finally {
+    delete fake.chrome.__respondTo[MESSAGE_TYPES.RECORDING_STARTED];
+    order.restore();
+    dispose.restore();
+  }
+});
+
+test('정상 중지에서도 영상 리더를 끝낸 뒤 캡처 트랙을 멈추고, 완성된 세션의 dispose는 결과 파일을 건드리지 않는다', async () => {
+  const userDir = new FakeDirectoryHandle('Recordings');
+  await useSaveFolder(userDir);
+  installVideoFakes(6);
+  const reader = frameReader;
+  const order = useStopOrderStream(reader);
+  const dispose = spySessionDispose();
+  try {
+    const plan = resolveRecordingPlan({ mode: RECORDING_MODES.VIDEO_AUDIO, videoFormat: 'mp4' });
+    const complete = await recordToFolder({ plan, audioFormat: 'mp3' });
+    assert.ok(complete, 'RECORDING_COMPLETE');
+    assert.deepEqual(userDir.fileNames(), [`${BASE}.mp4`], '완성된 영상 파일은 그대로');
+    const videoStop = order.stops.find(s => s.kind === 'video');
+    assert.ok(videoStop && videoStop.readerCancelled && videoStop.encodersClosed, '세션 중지(리더 종료·인코더 닫기) 뒤에 트랙 중지');
+    assert.deepEqual(reader.unclosed(), []);
+    assert.ok(dispose.calls.every(c => c.finished), 'dispose는 완성된 세션에만 불림 (아무것도 지우지 않음)');
+  } finally {
+    order.restore();
+    dispose.restore();
+  }
 });

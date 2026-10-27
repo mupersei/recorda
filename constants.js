@@ -144,6 +144,9 @@ export const VIDEO_SETTINGS = {
   MIN_BITRATE: 1_000_000,
   MAX_BITRATE: 12_000_000,
   MAX_ENCODE_QUEUE: 5,            // 인코더 큐가 이 값을 넘으면 프레임 드롭
+  // 중지 시 대기 중 read가 다음 프레임을 받을 때까지 기다리는 상한(ms). Chrome은 대기 read가 있는 채로 리더를 cancel하거나 트랙을
+  // 멈추면 그 read에 주려고 만든 VideoFrame을 close 없이 버리므로(누수 경고) 프레임이 오던 중이면 그 프레임을 받아 닫은 뒤 cancel
+  STOP_DRAIN_TIMEOUT_MS: 200,
   LATENCY_MODE: 'realtime',       // WebCodecs latencyMode ('realtime' | 'quality')
   // 영상 컨테이너에 담기는 오디오 코덱 (MP3는 MP4/MOV/AVI 모두에서 재생 가능)
   CONTAINER_AUDIO_CODEC: 'mp3',

@@ -99,7 +99,7 @@ popup.js ──START/PAUSE/RESUME/STOP_RECORDING──▶ background.js ──ST
 | `recording-plan.js` | 모드·포맷 → 캡처 여부와 출력 파일 목록(순수 함수) |
 | `encoders.js` | 오디오 단독 파일용 스트리밍 MP3/WAV 인코더 (기존) |
 | `container-audio-encoder.js` | 영상 컨테이너에 담을 MP3 프레임 생성 (작성기로 바로 넘기거나 AVI 청크 저장소에 쌓음) |
-| `video-recorder.js` | `VideoTrackEncoder`(WebCodecs H.264, 원본 타임스탬프 + `adjustTimestamp` 보정) + `VideoRecordingSession`(MP4/MOV/fMP4 직접 기록, AVI 머싱, 녹화 중 쓰기 실패 알림) |
+| `video-recorder.js` | `VideoTrackEncoder`(WebCodecs H.264, 원본 타임스탬프 + `adjustTimestamp` 보정, VideoFrame 수명 관리·집계 `stats`) + `VideoRecordingSession`(MP4/MOV/fMP4 직접 기록, AVI 머싱, 녹화 중 쓰기 실패 알림, 시작 실패 정리 `dispose`) |
 | `muxers/direct-mp4-writer.js` | `DirectMp4Writer`: 녹화 중 샘플을 최종 MP4/MOV의 mdat에 도착 순서대로 쓰고(8 MB 고정 버퍼), 중지 시 64비트 mdat 크기 패치 + moov만 작성 |
 | `muxers/fmp4-writer.js` | `FragmentedMp4Writer`: 조각 MP4 - 초기화 moov(mvex/trex) 뒤에 약 2초마다 `moof`+`mdat` 조각 기록, 쓰다 만 조각은 `free`로 남김(활성화), 기록한 조각은 메모리에서 버림 |
 | `muxers/mp4-muxer.js` | MP4/MOV 머서와 공통 moov 작성(`prepareMp4Tracks` + `buildMp4Moov`, 샘플 접근자·청크 오프셋 접근자 입력: 머서·직접 기록·fMP4 초기화 세그먼트가 같은 구현 사용). avc1 + mp4a/esds 또는 `.mp3`, MP3 인코더 지연 elst 보정 |
@@ -143,6 +143,41 @@ popup.js ──START/PAUSE/RESUME/STOP_RECORDING──▶ background.js ──ST
     한 프레임 간격은 남김)로 계산해 끊김 없이 이어 붙입니다. 정적인 화면처럼 프레임이 드물어 이 값이 실제 일시정지보다 길면 그 차이만큼 영상이
     오디오보다 앞서게 되므로, 실제(벽시계) 일시정지 시간 + 1프레임을 상한으로 둡니다.
 - 일시정지 중 중지하면 일시정지 전까지의 데이터로 정상적으로 파일을 만들고, 일시정지 중 탭이 닫혀도 녹화를 마무리합니다.
+
+### VideoFrame 수명 (누수 방지)
+
+Chrome은 `close()` 없이 GC된 VideoFrame을 10초 주기로 모아 offscreen 문서 콘솔(확장 프로그램 오류 목록)에
+"A VideoFrame was garbage collected without being closed. Applications should call close() on frames when done with them to prevent stalls."를
+남깁니다. 프레임은 GPU·공유 메모리 풀을 잡고 있어 늦게 해제되면 캡처가 멈칫할 수 있습니다.
+
+- 리더(`MediaStreamTrackProcessor`)가 전달한 프레임은 처리 결과(인코딩, 큐 포화 드롭, 일시정지, 인코더 오류, 중지 요청 뒤 도착)와 상관없이
+  `VideoTrackEncoder.releaseFrame()` 한곳에서 정확히 한 번 닫습니다(이미 닫혔거나 `close()`가 실패해도 안전, 같은 프레임을 두 번 세지 않음).
+  정규화(레터박스)로 만든 프레임은 그리기가 모두 끝난 뒤 마지막 단계에서만 만들고 encode 직후 같은 함수로 닫습니다.
+- 집계 `VideoTrackEncoder.stats`: `framesRead`(리더가 전달) = `framesClosed`(닫음), `framesEncoded`, `framesAfterStop`(중지 요청 뒤 받아 인코딩 없이 닫음),
+  `normalizedCreated` = `normalizedClosed`, `stopDrainMs`, `cancelledWithPendingRead`. 중지 시 `[VideoTrackEncoder] 완료: {..., frameStats}`로 남기고
+  세션 통계(`stats.frameStats`)에도 넣습니다.
+- **중지 경합 (실제 누수 원인)**: Chrome의 `MediaStreamTrackProcessor`는 read가 대기 중이면 다음 프레임을 VideoFrame으로 만든 뒤 별도 작업으로
+  스트림에 넣습니다(`FrameQueueUnderlyingSource::MaybeSendFrameFromQueueToStream` → `EnqueueBlinkFrame`). 그 사이에 리더를 `cancel()`하거나 트랙을
+  멈춰 스트림이 닫히면 그 프레임은 아무에게도 전달되지 못한 채 close 없이 버려집니다 - JS가 받은 프레임을 모두 닫아도 경고가 납니다. 이전 코드는
+  read가 대기 중인 상태로 `reader.cancel()`을 불러, 헤드리스 Chrome 148에서 중지마다 약 7%(실제 `VideoTrackEncoder` 4회 시작→중지 라운드 8번 중
+  2번, 40회 라운드는 5번 모두) 경고가 났습니다. 트랙을 먼저 멈추는 순서도 똑같이 누수됩니다(페이지 8개 × 중지 60회 중 5개 페이지에서 경고).
+  지금은 중지 시 프레임이 오던 중이면 대기 중 read가 다음 프레임을 받을 때까지 기다려(마지막 프레임 + 간격 4배, 간격은 잰 평균과 1/30초 중 큰 값,
+  상한 `VIDEO_SETTINGS.STOP_DRAIN_TIMEOUT_MS` 200 ms, 보통 33 ms 이내) 그 프레임을 인코딩하지 않고 닫은 뒤 대기 read가 없을 때 cancel합니다.
+  정적인 화면처럼 프레임이 끊긴 경우(전달 중인 프레임 없음)에는 기다리지 않습니다. 변경 후 같은 측정에서 400회 중지 모두 경고 0건, 중지 지연 평균 15~21 ms.
+- `configure()`/`encode()`가 동기 예외를 던지면(지원하지 않는 설정, 닫힌 코덱) 인코더 오류로 기록하고 이후 프레임도 계속 읽어 인코딩 없이 닫습니다
+  (예전에는 읽기를 멈춤). 중지 시 영상 인코딩 실패로 알립니다.
+- 시작 실패·중지 전 오류: offscreen `cleanup()`은 영상 세션 참조만 버리지 않고 `VideoRecordingSession.dispose()`를 기다린 **뒤에** 캡처 트랙을 멈춥니다
+  (리더 종료 → 인코더 닫기 → 폴더·OPFS에 쓰다 만 결과 파일과 AVI 청크 저장소 삭제). 정상 `stop()`을 마친 세션에는 아무것도 하지 않고, 진행 중인
+  `stop()`은 기다립니다. 모듈 상태는 처음에 바로 비워 정리하는 동안 시작한 다음 녹화와 섞이지 않습니다. 시작 도중(코덱 조회·결과 파일 열기 중)
+  중지·정리되면 인코더와 트랙 읽기를 시작하지 않고, 열린 결과 파일을 지웁니다.
+- 남는 경우: 탭이 닫히는 등 캡처 소스가 프레임이 오가는 도중에 끝나면 Chrome이 스트림을 스스로 닫으므로 그 순간 전달 중이던 프레임은 확장이 받을 수
+  없습니다(Chrome 내부, 확장에서 막을 수 없음).
+- E2E 실측(헤드리스 Chrome 148, 720p, Chrome 경고 `videoFrameLeakWarnings` 변경 전 → 후): 중지가 한 번인 시나리오 13개(`video-mp4`/`fmp4`/`avi`,
+  `pause-mp4`/`fmp4`, `resize-mp4`, `resize-aspect-mp4`, `folder-split-mp4-wav`, `leak-probe`, `quick-stop-mp4`, `tab-ended-mp4`, `no-video-mp4`,
+  `encoder-error-mp4`)는 전후 모두 0건(중지 1회로는 약 7%의 경합이 드러나지 않음), `stop-race-stress`(실제 `VideoTrackEncoder` 40회) 1 → 0건,
+  `record-cycles-mp4`(팝업 실제 흐름 20회) 1 → 0건. `start-fail-mp4`는 변경 전 OPFS에 쓰다 만 `video.mp4`가 남았고(열린 쓰기 스트림) 변경 후 지워집니다.
+  변경 후 모든 시나리오에서 리더가 전달한 프레임 = 닫은 프레임(하네스 집계와 확장 `stats` 일치), `resize-aspect-mp4` 정규화 프레임 193개 생성 = 193개
+  닫힘, `encoder-error-mp4`는 예외 뒤에도 읽기를 멈추지 않아 132개를 읽고 모두 닫음(변경 전 45개 읽고 멈춤). 중지 때 전달 중 프레임을 기다린 시간 0~19 ms.
 - 실측 (E2E `pause-mp4`, 720p, 8초 녹화 → 4초 일시정지 → 4초 녹화): 파일 길이 12.7초(일시정지를 포함했다면 약 16.9초), 재개 지점 포함 최대
   프레임 간격 82 ms, A/V 길이 차 0.00초. 가짜 소스의 영상 배경색(시간에 비례한 색상)과 오디오 LFO 위상을 일시정지 앞뒤로 비교하면 영상은 4160 ms,
   오디오는 4159 ms가 빠져 재개 후 A/V 어긋남은 1 ms 미만이었습니다. 일시정지 동안 CPU는 녹화 중 약 90%에서 약 30%(테스트용 가짜 소스 비용 포함)로
@@ -429,6 +464,14 @@ npm test
   ffprobe(패킷 수·재생 구간 = `buildMp4` 파일), `mehd`·`-sseof`, `ffmpeg -c copy -f mp4` 재머싱 경고 없음, **비정상 종료 안전성**: 쓰기 기록을
   재생해 조각 moof 안·trun 중간·mdat 중간·활성화 직전·조각 사이·마지막 바이트 직전에서 멈춘 파일과 완료 파일을 mdat 안·조각 사이에서 자른
   파일 모두 그 앞의 완전한 조각을 전부 디코딩하는지 ffprobe로 확인합니다.
+- VideoFrame 수명(`video-recorder.test.js`, `offscreen.test.js`): `FakeReader`가 넘겨진 프레임(`handed`)·전달한 프레임(`delivered`)·cancel 시점의
+  대기 read 수(`pendingReadsAtCancel`)를 기록하고, `inFlightOnCancel` 옵션으로 위 Chrome 동작(대기 read가 있는 채로 cancel하면 전달 중이던 프레임이
+  close 없이 버려짐)을 흉내 냅니다. 정상 중지, 중지 요청 뒤 쌓이거나 도착한 프레임, 프레임이 오던 중 중지(대기 read 없이 cancel)·첫 프레임 전 중지·
+  정적인 화면(기다리지 않음)·상한 초과, encode/configure 동기 예외, 인코더 오류 콜백, 정규화(`new VideoFrame` 실패, `drawImage` 실패, 정규화 프레임에서
+  encode 예외), 일시정지(`pause()` 직후 전달된 프레임 포함), `dispose()`(시작 실패 정리, 시작 도중 정리, 진행 중인 `stop()` 대기, 완성 파일 보존)에서
+  리더에 넘겨진 모든 프레임이 닫히고 `stats.framesRead = stats.framesClosed`인지 검사합니다. offscreen은 시작 실패(세션이 프레임을 읽은 뒤
+  RECORDING_STARTED 전송 실패) 정리에서 세션 `dispose` → 리더 종료가 캡처 트랙 중지보다 먼저인지, 인코더 닫힘, 폴더의 쓰다 만 영상 파일 삭제를
+  확인합니다. 영상 세션은 중지 때 전달 중인 프레임을 기다릴 수 있으므로 offscreen 테스트는 고정 대기 대신 완료 메시지를 기다립니다(`stopCapture`).
 - 세션(`video-recorder.test.js`): MP4/MOV/fMP4는 녹화 시작 때 결과 파일만 만들고(OPFS 청크 저장소 없음) 녹화 중 바로 기록, fMP4는 녹화 중
   조각 기록, `outputSinkFactory`를 시작 때 실제 포맷·MIME으로 요청(fmp4 → `.mp4`, `video/mp4`), AVI는 기존 중지 시 머싱, 녹화 중 쓰기 실패 →
   `onError(VIDEO_WRITE_FAILED)`·`stop()` 거부·실패 파일 삭제, `adjustTimestamp` = 메모리 경로 보정, fMP4 일시정지 연속성.
@@ -471,6 +514,18 @@ cd e2e && node run.mjs --duration=10 --long=60 --only=video-mp4,split-avi-wav
   `--verify=light`(장시간용)는 전체 디코딩 대신 패킷 수, 마지막 20초 디코딩, 파일 중간(기본: 길이의 절반, `--decodeAt=초`) 20초 디코딩을 검사합니다.
   각 파일은 ffprobe 스트림 정보, 전체 디코딩, 프레임 타임스탬프 단조성, A/V 길이 차, 파일명 규칙을 검사하고
   녹화 중 CPU/메모리(PSS, offscreen JS 힙)를 1초 간격으로 측정해 `e2e/output/report.json`에 남깁니다.
+- VideoFrame 누수 검사(모든 시나리오): Chrome을 `--js-flags=--expose-gc`로 띄워 녹화 중간(일시정지 시나리오는 일시정지 한가운데)에 한 번, 중지 직후에
+  `gc()`를 두 번 강제하고, Chrome 경고 타이머(10초)를 기다린 뒤(`RECORDA_LEAK_SETTLE_MS`, 기본 11.5초) offscreen 콘솔의 경고 수를
+  `videoFrameLeakWarnings`로 보고·검사(0건)합니다. 이 경고는 Blink가 `Log.entryAdded`로 남겨 콘솔 인자가 없으므로 메시지 텍스트로 셉니다.
+  offscreen 페이지에는 하네스 집계(`frameTally`)도 주입합니다: 리더가 전달한/닫은 프레임, `new VideoFrame`으로 만든/닫은 프레임, `encode` 호출 수,
+  `FinalizationRegistry`로 잡은 "close 없이 GC된 프레임". 확장의 집계(`stats.framesRead = framesClosed`)와 하네스 집계가 같은지도 검사하고, 끝에
+  시나리오별 요약(`report.leakSummary`)을 출력합니다. Chrome 경고는 10초 창마다 한 번으로 뭉치므로 경고 1건은 "1개 이상"입니다.
+- 누수 경로를 겨냥한 시나리오: `leak-probe`(15초 녹화 → 중지 → gc), `quick-stop-mp4`(녹화 중 표시가 뜨자마자 중지: 첫 프레임과 cancel의 경합),
+  `tab-ended-mp4`(6초 뒤 가짜 소스 트랙을 멈추고 ended → 확장이 스스로 마무리), `start-fail-mp4`(세션이 프레임을 읽기 시작한 뒤 RECORDING_STARTED
+  전송 실패 주입 → 시작 오류, OPFS에 쓰다 만 영상 파일 없음), `no-video-mp4`(영상 트랙 없음), `encoder-error-mp4`(45번째 `encode` 직전에 인코더를 닫아
+  동기 예외 → 영상 인코딩 실패 오류), `stop-race-stress`(offscreen 페이지에서 실제 `VideoTrackEncoder`를 40회 시작→중지),
+  `record-cycles-mp4`(같은 offscreen 문서에서 팝업으로 0.6~1.6초 녹화 20회), `leak-selftest`(`--only`로만: 일부러 닫지 않은 프레임이 경고·집계에
+  잡히는지 확인).
 
 ## 리소스 사용량 (헤드리스 Chrome 148, 소프트웨어 H.264, 12코어 샌드박스)
 
@@ -568,3 +623,6 @@ E2E 하네스의 합산 수치(`e2e/output/report.json`)에는 테스트용 가�
 - 영상 파일의 오디오는 항상 MP3입니다(AAC 미지원). 오디오 포맷 선택은 별도 저장되는 오디오 파일에만 적용됩니다.
 - Chrome `<video>`는 AVI를 재생하지 않습니다(VLC, mpv, Windows 미디어 플레이어 등에서 재생).
 - 화면 변화가 없는 탭은 프레임이 거의 생성되지 않으며, 이 경우 마지막 프레임이 오디오 끝까지 유지됩니다.
+- 녹화 중 탭이 닫히는(캡처 소스가 끝나는) 순간 Chrome 내부에서 전달 중이던 VideoFrame 하나는 확장이 받을 수 없어 "garbage collected without being
+  closed" 경고가 날 수 있습니다(Chrome이 스트림을 스스로 닫음). 중지 버튼·오류로 인한 중지는 대기 중 read를 먼저 끝내므로 해당하지 않습니다.
+  → [VideoFrame 수명](#videoframe-수명-누수-방지)
