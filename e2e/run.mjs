@@ -20,6 +20,11 @@
 //              offscreen 페이지에는 VideoFrame 집계(frameTally: 리더에서 받은/close한 프레임, new VideoFrame으로 만든/close한 프레임,
 //              encode 호출, FinalizationRegistry로 잡은 "close 없이 GC된 프레임")도 주입합니다.
 //  leak-selftest: --only로만. 일부러 닫지 않은 VideoFrame을 만들어 위 검사가 경고·집계를 실제로 잡는지 확인
+//  오디오 소스(audio-mic-wav, audio-mix-mp3, split-mix-mp4-wav, video-mic-mp4, audio-mic-fallback-wav): 마이크는 가짜로 바꾸지 않고
+//              Chrome 가짜 장치(--use-fake-device-for-media-stream + --use-file-for-fake-audio-capture=2.5 kHz 시험 신호)를 실제
+//              getUserMedia로 엽니다. 권한은 설정 페이지의 "마이크 권한 요청"(--use-fake-ui-for-media-stream이 권한 창을 자동 수락)으로
+//              먼저 허용하고, 팝업에서 마이크 항목이 활성인지 확인한 뒤 고릅니다. 결과 파일은 대역별 음량(ffmpeg volumedetect)으로
+//              마이크(2.5 kHz)·탭(가짜 오실레이터 440 Hz ± 200 Hz) 소리가 들어 있는지 확인합니다.
 import puppeteer from 'puppeteer';
 import { execFileSync, spawnSync, execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync, readFileSync, rmSync, openSync, writeSync, closeSync, readSync, copyFileSync } from 'node:fs';
@@ -69,6 +74,9 @@ const DURATION = Number(args.duration || 10);
 const RECORD_AGAIN_SEC = args.recordAgain ? (args.recordAgain === true ? 10 : Number(args.recordAgain)) : 0;
 const LONG_DURATION = Number(args.long || 0);
 const ONLY = args.only ? String(args.only).split(',') : null;
+// --noFakeUi: 권한 창 자동 수락(--use-fake-ui-for-media-stream) 없이 실행. 마이크 시나리오는 확장 출처의 마이크 권한을 CDP로 미리 허용
+//             (설정 페이지에서 허용해 둔 상태와 같음) → offscreen 문서의 마이크 getUserMedia가 권한 창 없이 기존 권한만으로 열리는지 확인
+const NO_FAKE_UI = !!args.noFakeUi;
 
 // ---- 테스트 매트릭스 ----
 const SCENARIOS = [
@@ -117,7 +125,18 @@ const SCENARIOS = [
   // 실제 흐름 반복: 같은 offscreen 문서에서 팝업으로 짧은 녹화(0.6~1.6초) 20회 시작→중지 (Background·Offscreen 정리 순서까지 포함)
   { id: 'record-cycles-mp4', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: [], cycles: { count: 20, minMs: 600, maxMs: 1600 } },
   // 누수 검사 자체 확인 (--only로만): 일부러 close하지 않은 VideoFrame → 경고와 집계(leakedCreated)가 잡혀야 함
-  { id: 'leak-selftest', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: [], selfTest: true, explicitOnly: true }
+  { id: 'leak-selftest', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: [], selfTest: true, explicitOnly: true },
+  // ---- 오디오 소스 (Chrome 가짜 마이크 장치, 권한은 설정 페이지에서 먼저 허용) ----
+  // 마이크만(오디오만 WAV): 탭은 캡처하지 않음(스트림 ID·탭 getUserMedia 없음), 설정 페이지에서 고른 장치(exact)로 녹음
+  { id: 'audio-mic-wav', mode: 'AUDIO_ONLY', audio: 'wav', video: 'mp4', expect: ['wav'], audioSource: 'mic', micDevice: 'pick' },
+  // 탭+마이크(오디오만 MP3): 탭 오디오와 마이크를 섞음 (시스템 기본 마이크)
+  { id: 'audio-mix-mp3', mode: 'AUDIO_ONLY', audio: 'mp3', video: 'mp4', expect: ['mp3'], audioSource: 'tab+mic' },
+  // 탭+마이크 분리 저장: 영상 파일 속 MP3와 WAV 모두 섞인 소리
+  { id: 'split-mix-mp4-wav', mode: 'VIDEO_AUDIO_SPLIT', audio: 'wav', video: 'mp4', expect: ['mp4', 'wav'], audioSource: 'tab+mic', micDevice: 'pick' },
+  // 마이크 + 영상(파일 1개): 탭에는 영상만 요청, 영상 파일의 오디오는 마이크
+  { id: 'video-mic-mp4', mode: 'VIDEO_AUDIO', audio: 'mp3', video: 'mp4', expect: ['mp4'], audioSource: 'mic' },
+  // 설정에 저장된 마이크가 없음(분리): exact 실패 → 시스템 기본 마이크로 녹음 + 시작 안내·완료 경고
+  { id: 'audio-mic-fallback-wav', mode: 'AUDIO_ONLY', audio: 'wav', video: 'mp4', expect: ['wav'], audioSource: 'mic', micDevice: 'missing', duration: 6, expectWarning: /시스템 기본 마이크로 녹음/ }
 ].filter(s => (!ONLY || ONLY.includes(s.id)) && (!s.explicitOnly || (ONLY && ONLY.includes(s.id))))
   // Chrome을 죽이는 시나리오는 맨 뒤로
   .sort((a, b) => (a.crashAt ? 1 : 0) - (b.crashAt ? 1 : 0));
@@ -129,6 +148,79 @@ if (LONG_DURATION > 0) {
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ---- 오디오 소스(마이크) 시나리오 ----
+const audioSourceOf = (sc) => sc.audioSource || 'tab';
+const USES_MIC = SCENARIOS.some(s => audioSourceOf(s) !== 'tab');
+// 가짜 마이크 시험 신호: 2.5 kHz 사인을 1 Hz로 진폭 변조(0~0.5, 클릭 없음, 잡음 억제가 정상 잡음으로 보지 않도록 계속 변함), 48 kHz 모노.
+// 탭 가짜 소스(440 Hz ± 200 Hz FM)와 대역이 겹치지 않아 결과 파일에서 두 소리를 따로 잴 수 있음
+const MIC_SIGNAL_HZ = 2500;
+function makeMicSignal(path) {
+  execFileSync(FFMPEG, ['-v', 'error', '-y', '-f', 'lavfi', '-i', `aevalsrc=0.5*sin(2*PI*${MIC_SIGNAL_HZ}*t)*(0.5-0.5*cos(2*PI*t)):s=48000:d=30`, '-ac', '1', '-c:a', 'pcm_s16le', path]);
+  return path;
+}
+// 대역별 음량 (dB, ffmpeg volumedetect): 전체 / 마이크 대역(2.0~3.2 kHz, 4차) / 탭 대역(800 Hz 이하, 4차)
+function audioLevels(path) {
+  const measure = (filter) => {
+    const r = spawnSync(FFMPEG, ['-v', 'info', '-nostats', '-i', path, '-vn', '-af', `${filter}volumedetect`, '-f', 'null', '-'], { encoding: 'utf8' });
+    const pick = (k) => { const m = (r.stderr || '').match(new RegExp(`${k}: (-?[\\d.]+|-inf) dB`)); return m ? (m[1] === '-inf' ? -200 : Number(m[1])) : null; };
+    return { meanDb: pick('mean_volume'), maxDb: pick('max_volume') };
+  };
+  return {
+    all: measure(''),
+    mic: measure('highpass=f=2000,highpass=f=2000,lowpass=f=3200,lowpass=f=3200,'),
+    tab: measure('lowpass=f=800,lowpass=f=800,')
+  };
+}
+// 설정 페이지에서 마이크 권한 허용(가짜 UI가 권한 창을 자동 수락) + 장치 선택. micDevice: 'pick'(첫 실제 장치) | 'missing'(없는 장치 ID) | 기본
+// cdp: 실행 내내 붙어 있는 브라우저 CDP 세션 (CDP 권한 덮어쓰기는 세션이 끊기면 사라짐)
+async function prepareMicFromSettings(browser, worker, extensionId, sc, cdp) {
+  const settings = await browser.newPage();
+  try {
+    await settings.goto(`chrome-extension://${extensionId}/settings.html`, { waitUntil: 'load' });
+    await settings.waitForFunction(() => document.body.dataset.ready === 'true', { timeout: 10_000 });
+    const stateOf = () => settings.evaluate(() => document.getElementById('micPermissionStatus').dataset.state);
+    const before = await stateOf();
+    let clicked = false;
+    let grantedBy = before === 'granted' ? 'already' : null;
+    if (before !== 'granted' && NO_FAKE_UI) {
+      // 권한 창에 응답할 수 없는 실행: 사용자가 설정 페이지에서 허용해 둔 상태를 CDP로 만듦 (확장 출처 전체에 적용)
+      await cdp.send('Browser.grantPermissions', { origin: `chrome-extension://${extensionId}`, permissions: ['audioCapture'] });
+      grantedBy = 'cdp';
+      await settings.waitForFunction(() => document.getElementById('micPermissionStatus').dataset.state === 'granted', { timeout: 10_000 });
+    } else if (before !== 'granted') {
+      await settings.click('#requestMicButton');
+      clicked = true;
+      grantedBy = 'settings-button';
+      await settings.waitForFunction(() => document.getElementById('micPermissionStatus').dataset.state === 'granted', { timeout: 10_000 });
+    }
+    const devices = await settings.$$eval('#micDeviceSelect option', els => els.map(o => ({ value: o.value, label: o.textContent.trim(), disabled: o.disabled })));
+    const message = await settings.$eval('#micMessage', el => el.textContent.trim());
+    let chosen = { value: '', label: devices[0] ? devices[0].label : '' };
+    if (sc.micDevice === 'pick') {
+      const device = devices.find(d => d.value && !d.disabled);
+      if (device) {
+        await settings.select('#micDeviceSelect', device.value);
+        chosen = device;
+      }
+    } else if (sc.micDevice === 'missing') {
+      chosen = { value: 'e2e-unplugged-device', label: 'E2E 분리된 마이크' };
+    } else if (devices.length) {
+      await settings.select('#micDeviceSelect', '');
+    }
+    await sleep(300);
+    if (sc.micDevice === 'missing') {
+      await worker.evaluate(async (c) => {
+        const { settings: s = {} } = await chrome.storage.sync.get('settings');
+        await chrome.storage.sync.set({ settings: { ...s, micDeviceId: c.value, micDeviceLabel: c.label } });
+      }, chosen);
+    }
+    const stored = await worker.evaluate(() => chrome.storage.sync.get('settings').then(r => r.settings || {}));
+    return { permissionBefore: before, requested: clicked, grantedBy, permissionAfter: await stateOf(), devices, settingsMessage: message, chosen, storedMicDeviceId: stored.micDeviceId };
+  } finally {
+    await settings.close();
+  }
+}
+
 // ---- 가짜 getUserMedia (offscreen 페이지에 주입) ----
 function fakeMediaScript(width, height, resize = null) {
   return `
@@ -136,7 +228,26 @@ function fakeMediaScript(width, height, resize = null) {
       const W = ${width}, H = ${height};
       const RESIZE = ${JSON.stringify(resize)};
       window.__e2e = { frames: 0 };
+      const nativeGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
       navigator.mediaDevices.getUserMedia = async (constraints) => {
+        // 마이크 요청(영상 없음 + 탭 캡처 제약 없음): 가짜로 바꾸지 않고 Chrome 가짜 장치로 실제 getUserMedia
+        // (권한은 설정 페이지에서 미리 허용 - 요청 시점의 권한 상태도 기록)
+        const isMic = !!constraints && !constraints.video && !!constraints.audio && !constraints.audio.mandatory;
+        if (isMic) {
+          (window.__e2e.micCalls = window.__e2e.micCalls || []).push(JSON.parse(JSON.stringify(constraints)));
+          window.__e2e.micPermissionAtRequest = await navigator.permissions.query({ name: 'microphone' }).then(s => s.state).catch(() => null);
+          window.__e2e.micResults = window.__e2e.micResults || [];
+          try {
+            const mic = await nativeGetUserMedia(constraints);
+            const track = mic.getAudioTracks()[0];
+            (window.__e2e.micStreams = window.__e2e.micStreams || []).push(mic);
+            window.__e2e.micResults.push({ ok: true, label: track ? track.label : null, settings: track && track.getSettings ? track.getSettings() : null });
+            return mic;
+          } catch (error) {
+            window.__e2e.micResults.push({ ok: false, name: error && error.name, message: error && error.message });
+            throw error;
+          }
+        }
         window.__e2e.constraints = JSON.parse(JSON.stringify(constraints));
         // 같은 문서에서 다시 캡처하면(record-cycles) 이전 가짜 소스(그리기 타이머·캔버스·AudioContext)를 먼저 정리
         if (window.__e2e.timer) { clearInterval(window.__e2e.timer); window.__e2e.timer = null; }
@@ -145,23 +256,26 @@ function fakeMediaScript(width, height, resize = null) {
         window.__e2e.captures = (window.__e2e.captures || 0) + 1;
         const stream = new MediaStream();
         window.__e2e.stream = stream; // 탭 닫힘 흉내(트랙 종료)용
-        const ctx = new AudioContext({ sampleRate: 48000 });
-        await ctx.resume();
-        const osc = ctx.createOscillator();
-        osc.type = 'sine';
-        osc.frequency.value = 440;
-        const lfo = ctx.createOscillator();
-        lfo.frequency.value = 2;
-        const lfoGain = ctx.createGain();
-        lfoGain.gain.value = 200;
-        lfo.connect(lfoGain).connect(osc.frequency);
-        const gain = ctx.createGain();
-        gain.gain.value = 0.5;
-        const dest = ctx.createMediaStreamDestination();
-        osc.connect(gain).connect(dest);
-        osc.start(); lfo.start();
-        stream.addTrack(dest.stream.getAudioTracks()[0]);
-        window.__e2e.audioCtx = ctx;
+        // 탭 오디오는 요청했을 때만 (오디오 소스 '마이크'는 탭 오디오를 요청하지 않음 - 실제 tabCapture처럼 오디오 트랙 없음)
+        if (constraints.audio) {
+          const ctx = new AudioContext({ sampleRate: 48000 });
+          await ctx.resume();
+          const osc = ctx.createOscillator();
+          osc.type = 'sine';
+          osc.frequency.value = 440;
+          const lfo = ctx.createOscillator();
+          lfo.frequency.value = 2;
+          const lfoGain = ctx.createGain();
+          lfoGain.gain.value = 200;
+          lfo.connect(lfoGain).connect(osc.frequency);
+          const gain = ctx.createGain();
+          gain.gain.value = 0.5;
+          const dest = ctx.createMediaStreamDestination();
+          osc.connect(gain).connect(dest);
+          osc.start(); lfo.start();
+          stream.addTrack(dest.stream.getAudioTracks()[0]);
+          window.__e2e.audioCtx = ctx;
+        }
 
         // no-video-mp4: 영상 모드인데 영상 트랙 없이 돌려줌 (NO_VIDEO 시작 오류)
         if (constraints.video && !window.__e2eNoVideo) {
@@ -804,6 +918,8 @@ async function main() {
     env.LD_LIBRARY_PATH = `${LIB_DIR}/usr/lib/x86_64-linux-gnu:${LIB_DIR}/lib/x86_64-linux-gnu:${process.env.LD_LIBRARY_PATH || ''}`;
   }
 
+  // 마이크 시나리오: Chrome 가짜 마이크 장치가 시험 신호 파일을 재생 (권한 창은 --use-fake-ui-for-media-stream이 자동 수락)
+  const micSignal = USES_MIC ? makeMicSignal(join(OUT_DIR, 'e2e-mic-signal.wav')) : null;
   const browser = await puppeteer.launch({
     headless: true,
     env,
@@ -813,13 +929,15 @@ async function main() {
       '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
       `--disable-extensions-except=${EXT_DIR}`, `--load-extension=${EXT_DIR}`,
       '--autoplay-policy=no-user-gesture-required',
-      '--use-fake-ui-for-media-stream',
+      ...(NO_FAKE_UI ? [] : ['--use-fake-ui-for-media-stream']),
+      ...(micSignal ? ['--use-fake-device-for-media-stream', `--use-file-for-fake-audio-capture=${micSignal}`] : []),
       '--disable-features=DialMediaRouteProvider',
       '--window-size=1400,900',
       // VideoFrame 누수 검사: offscreen 페이지에서 gc()를 강제해 close 없이 버려진 프레임의 Chrome 경고를 시나리오 안에서 드러냄
       '--js-flags=--expose-gc'
     ]
   });
+  if (micSignal) log(`가짜 마이크 시험 신호: ${MIC_SIGNAL_HZ} Hz 진폭 변조 사인 (${micSignal})${NO_FAKE_UI ? ' | 권한 창 자동 수락 없음(--noFakeUi): 마이크 권한은 CDP로 미리 허용' : ''}`);
   const browserPid = browser.process().pid;
   throttle = THROTTLE_MB > 0 ? startPressureThrottle({ thresholdMB: THROTTLE_MB, log }) : null;
   if (throttle) log(`메모리 압력 스로틀: 컨테이너 ${THROTTLE_MB} MB 초과 시 확장 렌더러 일시정지 (테스트 환경 장치)`);
@@ -1053,12 +1171,33 @@ async function main() {
       });
       swLogStart = swLogs.length;
       popLogStart = popLogs.length;
+      // 마이크 시나리오: 설정 페이지에서 권한 허용 + 장치 선택 (offscreen 문서는 권한 창을 띄울 수 없으므로 실제 사용 순서대로 먼저)
+      const audioSource = audioSourceOf(sc);
+      if (audioSource !== 'tab') {
+        result.mic = await prepareMicFromSettings(browser, worker, extensionId, sc, cdp);
+        log(`  마이크 준비(설정 페이지): 권한 ${result.mic.permissionBefore} → ${result.mic.permissionAfter} (${result.mic.grantedBy}), 장치 ${result.mic.devices.map(d => d.label).join(' / ')}, 사용 ${result.mic.chosen.label || '시스템 기본'} (${result.mic.storedMicDeviceId || '기본'})`);
+        result.checks.push({ name: `설정 페이지: 마이크 권한 ${result.mic.permissionBefore} → ${result.mic.permissionAfter} (${result.mic.grantedBy}), 장치 ${result.mic.devices.length - 1}개`, pass: result.mic.permissionAfter === 'granted' && result.mic.devices.length >= 2 });
+      }
+
       await popPage.goto(`chrome-extension://${extensionId}/popup.html`, { waitUntil: 'load' });
       await popPage.waitForSelector('#mainContainer.loaded', { timeout: 10_000 });
       await popPage.select('#modeSelect', sc.mode);
       await popPage.select('#formatSelect', sc.audio);
       await popPage.select('#videoFormatSelect', sc.video);
+      // 오디오 소스 (이전 시나리오의 선택이 남지 않도록 항상 지정). 마이크 항목은 권한이 있을 때만 활성
+      const sourceUi = await popPage.evaluate(() => {
+        const select = document.getElementById('audioSourceSelect');
+        return { permission: select.dataset.micPermission, disabled: [...select.options].filter(o => o.disabled).map(o => o.value) };
+      });
+      await popPage.select('#audioSourceSelect', audioSource);
       await sleep(300); // 설정 저장 대기
+      const selectedSource = await popPage.$eval('#audioSourceSelect', el => el.value);
+      result.audioSource = { requested: audioSource, selected: selectedSource, popupPermission: sourceUi.permission, disabledOptions: sourceUi.disabled };
+      if (audioSource !== 'tab') {
+        result.checks.push({ name: `popup: 마이크 권한 ${sourceUi.permission} → 마이크 항목 활성(비활성 항목: ${sourceUi.disabled.join(', ') || '없음'}), 오디오 소스 "${selectedSource}" 선택`, pass: sourceUi.permission === 'granted' && sourceUi.disabled.length === 0 && selectedSource === audioSource });
+      } else {
+        result.checks.push({ name: `popup: 오디오 소스 "${selectedSource}"`, pass: selectedSource === 'tab' });
+      }
 
       const ui = await popPage.evaluate(() => ({
         videoColumnDisabled: document.getElementById('videoColumn').classList.contains('disabled'),
@@ -1182,6 +1321,12 @@ async function main() {
       await popPage.click('#recordButton');
       await popPage.waitForFunction(() => /녹화 중|녹음 중/.test(document.querySelector('#status').textContent), { timeout: 20_000 });
       const startLatencyMs = Date.now() - t0;
+      if (sc.expectWarning) {
+        // 시작 경고(고른 마이크 대신 시스템 기본 마이크): START_RECORDING 응답 warnings → 팝업 안내
+        const startMessage = await popPage.$eval('#message', el => ({ text: el.textContent.trim(), cls: el.className }));
+        result.startMessage = startMessage.text;
+        result.checks.push({ name: `popup: 시작 안내 "${startMessage.text}"`, pass: startMessage.cls.includes('info') && sc.expectWarning.test(startMessage.text) });
+      }
       // quick-stop: 녹화 중 표시가 뜨자마자 중지 (아래 대기·확인 단계는 중지 뒤로 미룸)
       const statusText = sc.quickStop ? '' : await popPage.$eval('#status', el => el.textContent);
       if (!sc.quickStop) result.checks.push({ name: `popup: 시작 후 상태 "${statusText.trim()}" (${startLatencyMs}ms)`, pass: true });
@@ -1196,10 +1341,39 @@ async function main() {
         }, Math.max(0, midAtMs - (Date.now() - t0)));
       }
 
-      // 캡처 제약 확인
+      // 캡처 제약 확인 (탭 캡처: 영상·탭 오디오 요청이 모드·오디오 소스와 일치, 마이크: 처리 옵션·장치 지정)
       const checkConstraints = async () => {
-        const constraints = await offPage.evaluate(() => window.__e2e.constraints);
-        result.checks.push({ name: 'getUserMedia: video 제약 요청 여부가 모드와 일치', pass: !!constraints.video === (sc.mode !== 'AUDIO_ONLY'), detail: JSON.stringify(constraints.video || false) });
+        const e2e = await offPage.evaluate(() => ({
+          constraints: window.__e2e.constraints || null,
+          micCalls: window.__e2e.micCalls || [],
+          micResults: window.__e2e.micResults || [],
+          micPermissionAtRequest: window.__e2e.micPermissionAtRequest || null
+        }));
+        const wantsTab = sc.mode !== 'AUDIO_ONLY' || audioSource !== 'mic';
+        if (!wantsTab) {
+          result.checks.push({ name: '탭 캡처 요청 없음 (오디오만 + 마이크: 스트림 ID·탭 getUserMedia 없음)', pass: e2e.constraints === null, detail: JSON.stringify(e2e.constraints) });
+        } else {
+          const constraints = e2e.constraints || {};
+          result.checks.push({ name: 'getUserMedia: video 제약 요청 여부가 모드와 일치', pass: !!constraints.video === (sc.mode !== 'AUDIO_ONLY'), detail: JSON.stringify(constraints.video || false) });
+          result.checks.push({ name: `getUserMedia: 탭 오디오 요청 ${!!constraints.audio} (오디오 소스 ${audioSource})`, pass: !!constraints.audio === (audioSource !== 'mic'), detail: JSON.stringify(constraints.audio || false) });
+        }
+        if (audioSource === 'tab') {
+          result.checks.push({ name: '마이크 요청 없음', pass: e2e.micCalls.length === 0 });
+          return;
+        }
+        result.micCapture = e2e;
+        const first = (e2e.micCalls[0] || {}).audio || {};
+        const processing = first.echoCancellation === true && first.noiseSuppression === true && first.autoGainControl === true;
+        const expectedId = sc.micDevice === 'pick' || sc.micDevice === 'missing' ? (result.mic && result.mic.chosen.value) : null;
+        const deviceOk = expectedId ? !!first.deviceId && first.deviceId.exact === expectedId : !first.deviceId;
+        const last = e2e.micResults.at(-1) || {};
+        result.checks.push({ name: `마이크 getUserMedia: 에코 제거·잡음 억제·자동 음량 ${processing}, 장치 ${first.deviceId ? `exact ${String(first.deviceId.exact).slice(0, 12)}…` : '지정 없음(기본)'}, 요청 시점 권한 ${e2e.micPermissionAtRequest}, 결과 ${last.ok ? `열림 "${last.label}" ${last.settings && last.settings.sampleRate} Hz` : `${last.name}`}`, pass: processing && deviceOk && e2e.micPermissionAtRequest === 'granted' && last.ok === true });
+        if (sc.micDevice === 'missing') {
+          const retry = (e2e.micCalls[1] || {}).audio || {};
+          result.checks.push({ name: `없는 장치(exact) 실패 → 기본 마이크로 재시도 (${e2e.micResults.map(r => (r.ok ? 'ok' : r.name)).join(' → ')})`, pass: e2e.micCalls.length === 2 && !retry.deviceId && e2e.micResults[0] && e2e.micResults[0].ok === false && last.ok === true });
+        } else {
+          result.checks.push({ name: `마이크 요청 ${e2e.micCalls.length}회 (재시도 없음)`, pass: e2e.micCalls.length === 1 });
+        }
       };
       if (!sc.quickStop) {
         await sleep(500);
@@ -1353,7 +1527,10 @@ async function main() {
       result.stopProcessingMs = stopLatencyMs;
       result.checks.push(sc.expectError
         ? { name: `popup: 오류 메시지 "${message.text}" (${stopLatencyMs}ms)`, pass: message.cls.includes('error') && sc.expectError.test(message.text) }
-        : { name: `popup: 완료 메시지 "${message.text}" (${stopLatencyMs}ms, 저장 중 표시: ${sawSaving ? '있음' : '없음'})`, pass: message.cls.includes('success') });
+        : sc.expectWarning
+          // 완료 메시지 뒤에 경고(ERROR 메시지)가 이어서 표시됨 - 어느 쪽을 먼저 보든 통과, 경고 내용은 RECORDING_COMPLETE로 확인
+          ? { name: `popup: 완료/경고 메시지 "${message.text}" (${stopLatencyMs}ms)`, pass: message.cls.includes('success') || (message.cls.includes('error') && sc.expectWarning.test(message.text)) }
+          : { name: `popup: 완료 메시지 "${message.text}" (${stopLatencyMs}ms, 저장 중 표시: ${sawSaving ? '있음' : '없음'})`, pass: message.cls.includes('success') });
       if (sc.quickStop) {
         await checkConstraints();
         log(`  시작 직후 중지: 녹화 중 표시 → 중지 클릭 ${result.quickStopRecordedMs} ms (시작 클릭 → 녹화 중 표시 ${startLatencyMs} ms)`);
@@ -1482,6 +1659,18 @@ async function main() {
         if (complete) result.recordingComplete = complete.data;
         if (spyInstalled) result.checks.push({ name: `다운로드 저장: DOWNLOAD_FILE ${sentDownloads.length}개, RECORDING_COMPLETE savedTo=${complete && complete.data.savedTo}`, pass: sentDownloads.length === sc.expect.length && !!complete && complete.data.savedTo === 'downloads' });
       }
+      // 오디오 소스: 완료 경고(고른 마이크 대신 기본 마이크 등)와 중지 후 마이크 트랙 종료 (마이크 사용 표시 꺼짐)
+      if (result.recordingComplete) {
+        const warning = result.recordingComplete.warning || '';
+        if (sc.expectWarning) result.checks.push({ name: `RECORDING_COMPLETE 경고 "${warning}"`, pass: sc.expectWarning.test(warning) });
+        else if (audioSource !== 'tab') result.checks.push({ name: `RECORDING_COMPLETE 경고 없음${warning ? ` ("${warning}")` : ''}`, pass: !warning });
+      }
+      if (audioSource !== 'tab') {
+        const micTracks = await offPage.evaluate(() => (window.__e2e.micStreams || []).flatMap(s => s.getTracks().map(t => t.readyState))).catch(() => []);
+        result.micTracksAfterStop = micTracks;
+        result.checks.push({ name: `중지 후 마이크 트랙 ${micTracks.join(', ') || '없음'} (offscreen이 마이크를 닫음)`, pass: micTracks.length >= 1 && micTracks.every(s => s === 'ended') });
+      }
+
       const exts = files.map(f => f.split('.').pop()).sort();
       const expectedExts = RECORD_AGAIN_SEC > 0 && saveToFolder ? [...sc.expect, ...sc.expect] : [...sc.expect];
       result.checks.push({ name: `${saveToFolder ? '폴더' : '다운로드'} 파일 ${files.length}개: ${files.join(', ')}`, pass: JSON.stringify(exts) === JSON.stringify(expectedExts.sort()) });
@@ -1539,6 +1728,23 @@ async function main() {
           result.checks.push({ name: `${f}: 조각 tfdt가 끊김 없이 이어짐 (영상·오디오${sc.pause ? ', 일시정지 앞뒤 포함' : ''}, 불연속 ${st.continuityErrors.length}건)`, pass: st.continuityErrors.length === 0, detail: st.continuityErrors.slice(0, 3).join('; ') });
           result.checks.push({ name: `${f}: 조각 길이 중앙값 ${st.medianFragmentSec}s · 최대 ${st.maxFragmentSec}s, 키프레임으로 시작하는 조각 ${st.keyframeStartRatio === null ? '-' : Math.round(st.keyframeStartRatio * 100)}%`, pass: st.fragments === 1 || (st.maxFragmentSec <= 3 && st.keyframeStartRatio >= 0.9) });
           if (v && a) result.checks.push({ name: `${f}: 조각의 샘플 수 = ffprobe 패킷 수 (영상 ${st.videoSamples}/${v.nb_read_frames}, 오디오 ${st.audioFrames}/${a.nb_read_frames})`, pass: st.videoSamples === Number(v.nb_read_frames) && st.audioFrames === Number(a.nb_read_frames) });
+        }
+        // 오디오 소스 검증: 대역별 음량으로 마이크(2.5 kHz 시험 신호)·탭(440 Hz ± 200 Hz) 소리가 들어 있는지.
+        // 들어 있어야 하는 쪽: 최대 > -30 dB이고 평균 > -40 dB. 없어야 하는 쪽: 평균이 들어 있는 쪽보다 20 dB 이상 작음
+        // (최대값은 시작 순간의 짧은 과도음(MP3 시작, 자동 음량 적응)에 좌우되므로 '없음' 판정에는 평균을 씀)
+        if (a && USES_MIC) {
+          const levels = audioLevels(path);
+          fileResult.levels = levels;
+          const hasTab = audioSource !== 'mic';
+          const hasMic = audioSource !== 'tab';
+          const fmt = (l) => `최대 ${l.maxDb} / 평균 ${l.meanDb} dB`;
+          result.checks.push({ name: `${f}: 소리 있음 (전체 ${fmt(levels.all)})`, pass: levels.all.maxDb !== null && levels.all.maxDb > -30 && levels.all.meanDb > -60 });
+          result.checks.push({
+            name: `${f}: 오디오 소스 ${audioSource} → 마이크 대역(${MIC_SIGNAL_HZ} Hz) ${fmt(levels.mic)}, 탭 대역(≤800 Hz) ${fmt(levels.tab)}`,
+            pass: levels.mic.maxDb !== null && levels.tab.maxDb !== null
+              && (hasMic ? levels.mic.maxDb > -30 && levels.mic.meanDb > -40 : levels.mic.meanDb < levels.tab.meanDb - 20)
+              && (hasTab ? levels.tab.maxDb > -30 && levels.tab.meanDb > -40 : levels.tab.meanDb < levels.mic.meanDb - 20)
+          });
         }
         const aTimeline = a ? audioTimeline(path) : null;
         fileResult.audioTimeline = aTimeline;

@@ -171,6 +171,49 @@
       word-break: keep-all;
     }
 
+    /* 라벨 줄: 라벨 + 오른쪽 짧은 안내 (같은 줄 높이라 높이가 늘지 않음, 들어가지 않는 폰트에서는 다음 줄로) */
+    .label-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      column-gap: 6px;
+    }
+
+    .inline-note {
+      font-size: 10px;
+      line-height: 15px;
+      color: #999;
+      white-space: nowrap;
+    }
+
+    /* 마이크 권한 안내: 오디오 소스 아래 한 줄 링크 (누르면 설정 페이지에서 권한 요청) */
+    .link-hint {
+      align-self: flex-start;
+      max-width: 100%;
+      padding: 0;
+      font-size: 10px;
+      line-height: 13px;
+      font-weight: 400;
+      color: #1565c0;
+      background: none;
+      border-radius: 0;
+      text-align: left;
+      text-decoration: underline;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .link-hint:hover {
+      color: #0d47a1;
+    }
+
+    .link-hint:focus-visible {
+      outline: 2px solid #4CAF50;
+      outline-offset: 1px;
+    }
+
     /* 녹화 중에는 일시정지/재개 버튼과 중지 버튼을 한 줄에 나란히 (대기 중에는 시작 버튼만 전체 폭) */
     .button-row > button {
       flex: 1 1 0;
@@ -427,13 +470,26 @@
         <!-- 오른쪽: 오디오 설정 (영상+오디오 파일 1개 모드에서는 오디오 포맷만 비활성) -->
         <section id="audioColumn" class="settings-column" aria-labelledby="audioColumnTitle">
           <h2 id="audioColumnTitle" class="column-title">오디오</h2>
+          <!-- 오디오 소스: 모든 모드에서 활성 (오디오 파일·영상 파일 속 오디오 모두 이 소스). 마이크 권한이 없으면 마이크 항목 비활성 + 안내 -->
+          <div id="audioSourceGroup" class="format-selector">
+            <label for="audioSourceSelect">오디오 소스</label>
+            <select id="audioSourceSelect" title="탭: 이 탭의 소리 · 마이크: 설정 페이지에서 고른 마이크 · 탭+마이크: 두 소리를 섞어 녹음 (헤드폰 사용 권장 - 에코 방지)">
+              <option value="tab" selected>탭</option>
+              <option value="mic">마이크</option>
+              <option value="tab+mic" title="헤드폰 사용 권장 (에코 방지)">탭+마이크</option>
+            </select>
+            <button id="micPermissionHint" class="link-hint hidden" type="button" title="마이크 권한이 없어 마이크 · 탭+마이크를 고를 수 없습니다. 눌러서 설정 페이지를 열고 &quot;마이크 권한 요청&quot;으로 허용하세요.">마이크 권한: 설정에서 허용</button>
+          </div>
+
           <div id="audioFormatGroup" class="format-selector">
-            <label for="formatSelect">오디오 포맷</label>
+            <div class="label-row">
+              <label for="formatSelect">오디오 포맷</label>
+              <span id="audioFormatNote" class="inline-note hidden">영상 파일에 포함</span>
+            </div>
             <select id="formatSelect">
               <option value="wav" selected>WAV (무손실)</option>
               <option value="mp3">MP3 (압축)</option>
             </select>
-            <div id="audioFormatNote" class="column-note hidden">영상 파일에 포함</div>
           </div>
 
           <div class="format-selector">

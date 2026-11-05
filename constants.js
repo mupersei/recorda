@@ -54,6 +54,20 @@ export const SAVE_LOCATIONS = {
   FOLDER: 'folder'        // 설정 페이지에서 고른 폴더에 직접 기록 (File System Access API, 복사 단계 없음)
 };
 
+// Audio Sources - 녹음할 오디오 소스 (영상은 항상 녹화를 시작한 탭에서 캡처)
+export const AUDIO_SOURCES = {
+  TAB: 'tab',            // 탭 오디오 (기본, 기존 동작)
+  MIC: 'mic',            // 시스템 마이크 (설정 페이지에서 고른 장치, 권한도 설정 페이지에서 허용)
+  TAB_AND_MIC: 'tab+mic' // 탭 오디오 + 마이크를 섞어 녹음 (헤드폰 권장: 스피커 소리가 마이크로 다시 들어가면 에코)
+};
+
+// 마이크 캡처 설정 (offscreen getUserMedia 제약 + 믹서 게인)
+export const MIC_SETTINGS = {
+  // 음성 녹음용 처리: 에코 제거(스피커로 나오는 탭 소리 일부 제거), 잡음 억제, 자동 음량
+  PROCESSING: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  SOURCE_GAIN: 1 // 소스별 GainNode 값 (탭·마이크 모두 1 = 원음 그대로 합산)
+};
+
 // Default Settings - 사용자 설정 기본값
 export const DEFAULT_SETTINGS = {
   fileFormat: 'mp3',           // 오디오 저장 포맷 (mp3, wav)
@@ -61,6 +75,9 @@ export const DEFAULT_SETTINGS = {
   sampleRate: 44100,           // 샘플레이트 (Hz)
   recordingMode: 'AUDIO_ONLY', // 녹화 모드 (RECORDING_MODES 참조)
   videoFormat: 'mp4',          // 영상 저장 포맷 (mp4, mov, avi, fmp4)
+  audioSource: 'tab',          // 오디오 소스 (AUDIO_SOURCES 값). 마이크 권한이 없으면 팝업은 'tab'으로 녹화 (저장 값은 그대로)
+  micDeviceId: '',             // 설정 페이지에서 고른 마이크 장치 ID ('' = 시스템 기본 마이크)
+  micDeviceLabel: '',          // 고른 마이크 이름 (장치가 연결되어 있지 않을 때 설정 페이지 안내용)
   // 저장 위치 미러: 팝업이 녹화 시작 때 폴더 권한 확인 여부를 정하는 데 사용 (폴더 핸들 자체는 IndexedDB에 보관 - save-location.js)
   saveLocationMode: 'downloads', // SAVE_LOCATIONS 값
   saveLocationName: ''           // 선택한 폴더 이름 (참고용, 표시는 설정 페이지에서만)
@@ -90,6 +107,14 @@ export const ERROR_MESSAGES = {
   VIDEO_ENCODING_FAILED: '영상 인코딩에 실패했습니다.',
   // 녹화 중 영상 파일을 저장 위치(폴더/OPFS)에 쓰지 못함 (권한 회수, 드라이브 분리, 디스크 부족 등) → 녹화를 멈추고 알림
   VIDEO_WRITE_FAILED: '영상 파일을 저장 위치에 쓰지 못해 녹화를 중지했습니다. 저장 폴더의 연결·권한 상태와 남은 디스크 공간을 확인해주세요.',
+  // 마이크 (offscreen 문서는 권한 창을 띄울 수 없으므로 권한은 설정 페이지에서 허용)
+  MIC_PERMISSION_DENIED: '마이크 권한이 없어 녹음을 시작할 수 없습니다. 설정 페이지(⚙)의 "마이크 권한 요청"으로 허용한 뒤 다시 시도해주세요.',
+  MIC_DEVICE_NOT_FOUND: '마이크를 찾을 수 없습니다. 마이크 연결을 확인하거나 설정 페이지(⚙)에서 다른 마이크를 선택해주세요.',
+  MIC_UNAVAILABLE: '마이크를 사용할 수 없습니다. 다른 프로그램이 마이크를 사용 중인지 확인해주세요.',
+  MIC_FALLBACK_DEFAULT: '설정에서 고른 마이크를 찾을 수 없어 시스템 기본 마이크로 녹음했습니다.',        // 완료 경고
+  MIC_FALLBACK_DEFAULT_START: '설정에서 고른 마이크를 찾을 수 없어 시스템 기본 마이크로 녹음합니다.',    // 시작 안내 (같은 경고의 현재형)
+  MIC_DISCONNECTED: '녹화 중 마이크 연결이 끊겨 그 이후의 마이크 소리는 녹음되지 않았습니다.',
+  MIC_DISCONNECTED_STOPPED: '마이크 연결이 끊겨 그때까지 녹음한 내용으로 파일을 저장했습니다.',
   DOWNLOAD_FAILED: '파일 다운로드에 실패했습니다.',
   UNKNOWN: '알 수 없는 오류가 발생했습니다.'
 };

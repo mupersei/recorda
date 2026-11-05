@@ -164,3 +164,128 @@ export function makeFakeVideoEncoder({ supported = ['avc1.42002A'], failOn = nul
   }
   return { FakeVideoEncoder, instances };
 }
+
+// ---- 마이크 / 권한 (navigator.mediaDevices, navigator.permissions) 가짜 ----
+
+/** MediaStreamTrack 흉내: stop() 기록, ended 흉내(end()) */
+export class FakeMediaStreamTrack {
+  constructor(kind, label = '', settings = {}) {
+    this.kind = kind;
+    this.label = label;
+    this.enabled = true;
+    this.readyState = 'live';
+    this.onended = null;
+    this.stopped = false;
+    this.settings = settings;
+  }
+  stop() { this.stopped = true; this.readyState = 'ended'; }
+  getSettings() { return { ...this.settings }; }
+  /** 장치 분리 등으로 트랙이 끝남 (stop()과 달리 onended가 불림) */
+  end() { this.readyState = 'ended'; if (typeof this.onended === 'function') this.onended(); }
+}
+
+/** MediaStream 흉내 */
+export function makeFakeStream(tracks) {
+  return {
+    id: `stream-${Math.random().toString(36).slice(2, 8)}`,
+    tracks,
+    getTracks: () => [...tracks],
+    getAudioTracks: () => tracks.filter(t => t.kind === 'audio'),
+    getVideoTracks: () => tracks.filter(t => t.kind === 'video')
+  };
+}
+
+/** 마이크 스트림 (오디오 트랙 1개, 기본 48 kHz 모노 - 탭 캡처·AudioContext 샘플레이트와 다를 수 있음) */
+export function makeFakeMicStream({ label = 'Fake Mic', deviceId = 'mic-1', sampleRate = 48000, channelCount = 1 } = {}) {
+  return makeFakeStream([new FakeMediaStreamTrack('audio', label, { deviceId, sampleRate, channelCount })]);
+}
+
+/** DOMException 대신 이름만 맞춘 오류 (OverconstrainedError는 DOMException이 아님) */
+export function namedError(name, message = name, extra = {}) {
+  return Object.assign(new Error(message), { name }, extra);
+}
+
+/**
+ * navigator.permissions 흉내. query({name:'microphone'})는 같은 PermissionStatus 객체를 돌려주고 setState()로 바꾸면 change 이벤트
+ * options.unsupported: query가 TypeError를 던짐 (microphone 이름 미지원 환경)
+ */
+export function makeFakePermissions(initial = 'prompt', { unsupported = false } = {}) {
+  const listeners = new Set();
+  const status = {
+    name: 'microphone',
+    state: initial,
+    onchange: null,
+    addEventListener: (type, fn) => { if (type === 'change') listeners.add(fn); },
+    removeEventListener: (type, fn) => { if (type === 'change') listeners.delete(fn); }
+  };
+  const calls = [];
+  return {
+    calls,
+    status,
+    listenerCount: () => listeners.size + (typeof status.onchange === 'function' ? 1 : 0),
+    query: async (descriptor) => {
+      calls.push(descriptor);
+      if (unsupported) throw new TypeError(`The provided value '${descriptor && descriptor.name}' is not a valid enum value of type PermissionName.`);
+      return status;
+    },
+    setState(state) {
+      status.state = state;
+      const event = { type: 'change', target: status };
+      for (const fn of [...listeners]) fn(event);
+      if (typeof status.onchange === 'function') status.onchange(event);
+    }
+  };
+}
+
+/**
+ * navigator.mediaDevices 흉내 (마이크 권한 흐름 포함).
+ * - enumerateDevices: 권한(permissions.status.state)이 granted가 아니면 Chrome처럼 장치 이름·ID를 숨긴 항목 1개만 돌려줌
+ * - getUserMedia: 권한 granted → 스트림, prompt → promptAnswer('granted' | 'denied')로 응답(권한 상태도 바뀜), denied → NotAllowedError,
+ *   마이크가 하나도 없으면 NotFoundError. options.getUserMedia로 동작을 통째로 바꿀 수 있음
+ */
+export function makeFakeMediaDevices({ devices = [], permissions = null, promptAnswer = 'granted', getUserMedia = null } = {}) {
+  let list = devices.map(d => ({ kind: 'audioinput', groupId: '', ...d }));
+  const listeners = new Set();
+  const calls = { getUserMedia: [], enumerateDevices: 0 };
+  const streams = [];
+  const state = () => (permissions ? permissions.status.state : 'granted');
+  const md = {
+    calls,
+    streams,
+    promptAnswer,
+    ondevicechange: null,
+    addEventListener: (type, fn) => { if (type === 'devicechange') listeners.add(fn); },
+    removeEventListener: (type, fn) => { if (type === 'devicechange') listeners.delete(fn); },
+    listenerCount: () => listeners.size,
+    async enumerateDevices() {
+      calls.enumerateDevices++;
+      if (state() === 'granted') return list.map(d => ({ ...d }));
+      // 권한 전: 종류별로 이름·ID 없는 항목 하나만
+      return list.some(d => d.kind === 'audioinput') ? [{ kind: 'audioinput', deviceId: '', label: '', groupId: '' }] : [];
+    },
+    async getUserMedia(constraints) {
+      calls.getUserMedia.push(constraints);
+      if (getUserMedia) return getUserMedia(constraints);
+      const inputs = list.filter(d => d.kind === 'audioinput');
+      if (inputs.length === 0) throw namedError('NotFoundError', 'Requested device not found');
+      if (state() === 'denied') throw namedError('NotAllowedError', 'Permission denied');
+      if (state() === 'prompt') {
+        if (permissions) permissions.setState(md.promptAnswer);
+        if (md.promptAnswer !== 'granted') throw namedError('NotAllowedError', 'Permission denied');
+      }
+      const wanted = constraints && constraints.audio && constraints.audio.deviceId && constraints.audio.deviceId.exact;
+      const device = wanted ? inputs.find(d => d.deviceId === wanted) : (inputs.find(d => d.deviceId === 'default') || inputs[0]);
+      if (!device) throw namedError('OverconstrainedError', 'Constraints could not be satisfied', { constraint: 'deviceId' });
+      const stream = makeFakeMicStream({ label: device.label, deviceId: device.deviceId });
+      streams.push(stream);
+      return stream;
+    },
+    setDevices(next) { list = next.map(d => ({ kind: 'audioinput', groupId: '', ...d })); },
+    fireDeviceChange() {
+      const event = { type: 'devicechange' };
+      for (const fn of [...listeners]) fn(event);
+      if (typeof md.ondevicechange === 'function') md.ondevicechange(event);
+    }
+  };
+  return md;
+}

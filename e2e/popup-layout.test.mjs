@@ -1,6 +1,9 @@
 // 팝업 레이아웃 테스트 - 실제 Chrome에서 popup.html을 열어 모든 모드/상태에서 세로 스크롤 없이 표시되는지 확인
 // 실행: cd e2e && node --test popup-layout.test.mjs   (CHROME_LIB_DIR 등 환경 변수는 run.mjs와 동일)
 // 스크린샷: e2e/output/popup-<모드>.png(대기), popup-<모드>-RECORDING.png(녹화 중), settings-page.png (RECORDA_E2E_OUT으로 위치 변경)
+// 마이크: --use-fake-ui-for-media-stream 없이 실행하므로 확장 출처의 마이크 권한은 처음에 'prompt'(허용 안 됨) → 오디오 소스의 마이크 항목 비활성.
+//   권한 허용·회수는 CDP Browser.grantPermissions / resetPermissions(audioCapture)로 흉내 냄 (헤드리스에서는 권한 창에 응답할 수 없음).
+//   --use-fake-device-for-media-stream으로 가짜 마이크 장치를 씀 (설정 페이지 장치 목록, 권한 허용 후 getUserMedia)
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import puppeteer from 'puppeteer';
@@ -23,7 +26,7 @@ before(async () => {
   if (LIB_DIR) env.LD_LIBRARY_PATH = `${LIB_DIR}/usr/lib/x86_64-linux-gnu:${LIB_DIR}/lib/x86_64-linux-gnu:${process.env.LD_LIBRARY_PATH || ''}`;
   browser = await puppeteer.launch({
     headless: true, env,
-    args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', `--disable-extensions-except=${EXT_DIR}`, `--load-extension=${EXT_DIR}`]
+    args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', `--disable-extensions-except=${EXT_DIR}`, `--load-extension=${EXT_DIR}`, '--use-fake-device-for-media-stream']
   });
   const sw = await browser.waitForTarget(t => t.type() === 'service_worker' && t.url().startsWith('chrome-extension://'), { timeout: 30_000 });
   extensionId = new URL(sw.url()).host;
@@ -766,3 +769,312 @@ async function screenshotSettings(settings) {
   await settings.screenshot({ path, fullPage: true });
   console.log(`[popup-layout] 스크린샷 ${path}`);
 }
+
+// ---- 오디오 소스 (탭 / 마이크 / 탭+마이크)와 마이크 권한 ----
+const MIC_HINT = '마이크 권한: 설정에서 허용';
+
+/** 확장 출처의 마이크 권한: granted=true → 허용(CDP), false → 재설정(처음 상태 'prompt')
+ *  CDP 권한 덮어쓰기는 그것을 건 세션이 끊기면 함께 사라지므로 세션 하나를 계속 씀 */
+let permissionSession = null;
+async function setMicPermission(granted) {
+  if (!permissionSession) permissionSession = await browser.target().createCDPSession();
+  if (granted) await permissionSession.send('Browser.grantPermissions', { origin: `chrome-extension://${extensionId}`, permissions: ['audioCapture'] });
+  else await permissionSession.send('Browser.resetPermissions');
+}
+const micPermissionState = (target = page) => target.evaluate(() => navigator.permissions.query({ name: 'microphone' }).then(s => s.state));
+const storedSettings = () => swWorker.evaluate(() => chrome.storage.sync.get('settings').then(r => r.settings || {}));
+async function setStoredSettings(patch) {
+  await swWorker.evaluate(async (p) => {
+    const { settings = {} } = await chrome.storage.sync.get('settings');
+    await chrome.storage.sync.set({ settings: { ...settings, ...p } });
+  }, patch);
+}
+async function reloadPopup() {
+  await page.reload({ waitUntil: 'load' });
+  await page.waitForSelector('#mainContainer.loaded', { timeout: 10_000 });
+}
+async function audioSourceUi() {
+  return page.evaluate(() => {
+    const select = document.getElementById('audioSourceSelect');
+    const hint = document.getElementById('micPermissionHint');
+    const column = document.getElementById('audioColumn');
+    const r = hint.getBoundingClientRect();
+    return {
+      label: document.querySelector('label[for="audioSourceSelect"]').textContent.trim(),
+      options: [...select.options].map(o => [o.value, o.textContent.trim(), o.disabled]),
+      value: select.value,
+      disabled: select.disabled,
+      permission: select.dataset.micPermission,
+      inAudioColumn: column.contains(select),
+      firstInColumn: column.querySelector('.format-selector') === document.getElementById('audioSourceGroup'),
+      hint: {
+        visible: !hint.classList.contains('hidden') && r.height > 0,
+        text: hint.textContent.trim(),
+        height: r.height,
+        lineHeight: parseFloat(getComputedStyle(hint).lineHeight),
+        clipped: hint.scrollWidth > hint.clientWidth,
+        inAudioColumn: column.contains(hint),
+        tag: hint.tagName
+      }
+    };
+  });
+}
+/** START_RECORDING을 Background로 보내지 않고 가로채 데이터만 기록 (녹화는 run.mjs E2E에서) */
+async function captureStartRequest() {
+  await page.evaluate(() => {
+    window.__starts = [];
+    const original = chrome.runtime.sendMessage.bind(chrome.runtime);
+    chrome.runtime.sendMessage = async (message) => {
+      if (message && message.action === 'START_RECORDING') { window.__starts.push(message.data); return { success: true, data: null }; }
+      return original(message);
+    };
+  });
+  await pushState(sessionState('IDLE', 'VIDEO_AUDIO'));
+  await page.click('#recordButton');
+  await page.waitForFunction(() => window.__starts.length > 0, { timeout: 5000 });
+  const data = await page.evaluate(() => window.__starts[0]);
+  await reloadPopup(); // 가로채기 해제
+  return data;
+}
+
+test('오디오 소스(오른쪽 오디오 열 맨 위, 탭 / 마이크 / 탭+마이크): 마이크 권한이 없으면 마이크·탭+마이크 항목이 비활성이고 저장 값이 마이크여도 탭으로 고정되며, 한 줄 안내 "마이크 권한: 설정에서 허용"을 누르면 설정 페이지가 열린다', async () => {
+  await setMicPermission(false);
+  await setStoredSettings({ audioSource: 'mic', micDeviceId: '' });
+  await reloadPopup();
+  try {
+    assert.equal(await micPermissionState(), 'prompt', '이 Chrome은 권한 창 자동 수락 없이 실행 → 확장 출처의 마이크 권한은 처음에 prompt');
+    const ui = await audioSourceUi();
+    assert.equal(ui.label, '오디오 소스');
+    assert.equal(ui.inAudioColumn, true, '오른쪽 오디오 열');
+    assert.equal(ui.firstInColumn, true, '오디오 열의 첫 항목');
+    assert.deepEqual(ui.options, [['tab', '탭', false], ['mic', '마이크', true], ['tab+mic', '탭+마이크', true]], '마이크 항목 <option disabled>');
+    assert.equal(ui.value, 'tab', '탭으로 고정');
+    assert.equal(ui.permission, 'prompt');
+    assert.equal(ui.hint.visible, true, '안내 표시');
+    assert.equal(ui.hint.text, MIC_HINT);
+    assert.equal(ui.hint.inAudioColumn, true);
+    assert.ok(Math.abs(ui.hint.height - ui.hint.lineHeight) <= 0.5, `안내는 한 줄 (${ui.hint.height}px, 줄 높이 ${ui.hint.lineHeight}px)`);
+    assert.equal(ui.hint.clipped, false, '안내 글자가 잘리지 않음');
+    assert.equal((await storedSettings()).audioSource, 'mic', '권한 때문에 되돌린 값은 저장하지 않음');
+    console.log(`[popup-layout] 마이크 권한 없음: 오디오 소스 ${ui.value}, 항목 ${JSON.stringify(ui.options)}, 안내 "${ui.hint.text}" ${ui.hint.height}px`);
+
+    // 마이크 항목은 고를 수 없음 (선택해도 탭 유지)
+    await page.select('#audioSourceSelect', 'mic').catch(() => {});
+    await new Promise(r => setTimeout(r, 200));
+    assert.equal(await page.$eval('#audioSourceSelect', el => el.value), 'tab');
+    assert.equal((await storedSettings()).audioSource, 'mic');
+
+    // 녹화를 시작하면 탭 오디오로 요청
+    const data = await captureStartRequest();
+    assert.equal(data.audioSource, 'tab', 'START_RECORDING audioSource = tab (권한 없음)');
+
+    // 안내를 누르면 설정 페이지 (마이크 카드: 권한 확인 필요 + 요청 버튼)
+    const opened = browser.waitForTarget(t => t.url() === `chrome-extension://${extensionId}/settings.html`, { timeout: 10_000 });
+    await page.click('#micPermissionHint');
+    const settingsPage = await (await opened).page();
+    await settingsPage.waitForFunction(() => document.body.dataset.ready === 'true', { timeout: 10_000 });
+    const mic = await settingsPage.evaluate(() => {
+      const visible = (id) => { const el = document.getElementById(id); return !!el && !el.classList.contains('hidden') && el.getBoundingClientRect().height > 0; };
+      return { state: document.getElementById('micPermissionStatus').dataset.state, status: document.getElementById('micPermissionStatus').textContent.trim(), request: visible('requestMicButton'), devices: visible('micDeviceRow') };
+    });
+    assert.deepEqual({ state: mic.state, request: mic.request, devices: mic.devices }, { state: 'prompt', request: true, devices: false }, mic.status);
+    assert.match(mic.status, /확인 필요/);
+    await settingsPage.close();
+    await page.bringToFront();
+  } finally {
+    await setStoredSettings({ audioSource: 'tab' });
+  }
+});
+
+test('마이크 권한이 허용되면(확장 출처) 세 항목이 모두 활성·안내 숨김, 고른 소스는 storage.sync에 저장되어 다시 열어도 유지되고 녹화 시작에 그 값과 마이크 장치 ID를 보낸다. 같은 출처에서 getUserMedia(마이크)가 권한 창 없이 열린다. 권한을 회수하면 다시 탭으로 고정(저장 값 유지)', async () => {
+  try {
+    await setStoredSettings({ audioSource: 'mic', micDeviceId: 'e2e-mic-device' });
+    await setMicPermission(true);
+    await reloadPopup();
+    assert.equal(await micPermissionState(), 'granted');
+    let ui = await audioSourceUi();
+    assert.deepEqual(ui.options, [['tab', '탭', false], ['mic', '마이크', false], ['tab+mic', '탭+마이크', false]]);
+    assert.equal(ui.value, 'mic', '저장된 선택 복원');
+    assert.equal(ui.hint.visible, false, '안내 숨김');
+
+    await page.select('#audioSourceSelect', 'tab+mic');
+    await swWorker.evaluate(() => new Promise(r => setTimeout(r, 300)));
+    assert.equal((await storedSettings()).audioSource, 'tab+mic', 'chrome.storage.sync settings.audioSource');
+    await reloadPopup();
+    assert.equal(await page.$eval('#audioSourceSelect', el => el.value), 'tab+mic', '다시 열어도 유지');
+
+    const data = await captureStartRequest();
+    assert.equal(data.audioSource, 'tab+mic');
+    assert.equal(data.micDeviceId, 'e2e-mic-device', '설정 페이지에서 고른 장치 ID 전달');
+
+    // 녹화 중에는 다른 설정처럼 비활성
+    await pushState(sessionState('RECORDING', 'VIDEO_AUDIO', { startTime: Date.now(), effectiveStartTime: Date.now() }));
+    assert.equal(await page.$eval('#audioSourceSelect', el => el.disabled), true, '녹화 중 비활성');
+    await pushState(sessionState('IDLE', 'VIDEO_AUDIO'));
+    assert.equal(await page.$eval('#audioSourceSelect', el => el.disabled), false);
+
+    // 권한이 있는 확장 출처에서는 마이크 getUserMedia가 권한 창 없이 열림 (offscreen 문서도 같은 출처라 같은 권한을 씀)
+    const gum = await page.evaluate(async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      const track = stream.getAudioTracks()[0];
+      const out = { tracks: stream.getAudioTracks().length, label: track.label, sampleRate: track.getSettings().sampleRate };
+      stream.getTracks().forEach(t => t.stop());
+      return out;
+    });
+    console.log(`[popup-layout] 권한 허용 후 같은 출처의 마이크 getUserMedia: ${JSON.stringify(gum)}`);
+    assert.equal(gum.tracks, 1);
+
+    // 권한 허용 상태(안내 없음)의 높이와 스크린샷
+    for (const mode of MODES) {
+      await setMode(mode);
+      const l = await layout();
+      console.log(`[popup-layout] 마이크 권한 허용 ${mode} IDLE: 높이 ${l.height}px`);
+      assert.ok(l.height <= POPUP_MAX_HEIGHT, `${mode}: 높이 ${l.height}px`);
+    }
+    await setMode('VIDEO_AUDIO_SPLIT');
+    const shot = await screenshotPopup('popup-VIDEO_AUDIO_SPLIT-mic-granted');
+    assert.ok(shot.height <= POPUP_MAX_HEIGHT);
+
+    // 권한 회수 → 다시 탭으로 고정 (저장 값은 그대로)
+    await setMicPermission(false);
+    await reloadPopup();
+    ui = await audioSourceUi();
+    assert.equal(ui.permission, 'prompt');
+    assert.equal(ui.value, 'tab');
+    assert.deepEqual(ui.options.map(o => o[2]), [false, true, true]);
+    assert.equal(ui.hint.visible, true);
+    assert.equal((await storedSettings()).audioSource, 'tab+mic', '저장 값 유지 → 권한을 다시 허용하면 복원');
+  } finally {
+    await setMicPermission(false);
+    await setStoredSettings({ audioSource: 'tab', micDeviceId: '', micDeviceLabel: '' });
+    await reloadPopup();
+  }
+});
+
+test('설정 페이지 마이크 카드(저장 위치 아래): 권한 확인 필요 → 권한 허용 시 "허용됨"과 장치 목록(시스템 기본 마이크 + 오디오 입력), 장치를 고르면 micDeviceId 저장, 저장된 장치가 없으면 "(연결 안 됨)" 항목과 기본 마이크 안내, 탭+마이크 헤드폰 권장 안내', async () => {
+  await setMicPermission(false);
+  const settings = await browser.newPage();
+  await settings.setViewport({ width: 900, height: 700 });
+  const errors = [];
+  settings.on('pageerror', e => errors.push(e.message));
+  const open = async () => {
+    await settings.goto(`chrome-extension://${extensionId}/settings.html`, { waitUntil: 'load' });
+    await settings.waitForFunction(() => document.body.dataset.ready === 'true', { timeout: 10_000 });
+  };
+  const read = () => settings.evaluate(() => {
+    const visible = (id) => { const el = document.getElementById(id); return !!el && !el.classList.contains('hidden') && el.getBoundingClientRect().height > 0; };
+    const select = document.getElementById('micDeviceSelect');
+    const message = document.getElementById('micMessage');
+    const cards = [...document.querySelectorAll('section.card')].map(c => c.querySelector('h2').textContent.trim());
+    return {
+      cards,
+      state: document.getElementById('micPermissionStatus').dataset.state,
+      status: document.getElementById('micPermissionStatus').textContent.trim(),
+      request: visible('requestMicButton'),
+      deviceRow: visible('micDeviceRow'),
+      options: [...select.options].map(o => [o.value, o.textContent.trim(), o.disabled]),
+      value: select.value,
+      message: visible('micMessage') ? message.textContent.trim() : '',
+      echoNote: document.getElementById('micEchoNote').textContent.trim()
+    };
+  });
+  try {
+    await open();
+    let s = await read();
+    assert.deepEqual(s.cards, ['저장 위치', '마이크'], '마이크 카드는 저장 위치 아래');
+    assert.equal(s.state, 'prompt');
+    assert.equal(s.request, true);
+    assert.equal(s.deviceRow, false, '권한 전에는 장치 목록 없음');
+    assert.match(s.echoNote, /헤드폰 사용 권장 \(에코 방지\)/);
+
+    // 권한 허용 (다른 곳에서 허용 → PermissionStatus change 또는 다시 열기)
+    await setMicPermission(true);
+    await settings.waitForFunction(() => document.getElementById('micPermissionStatus').dataset.state === 'granted', { timeout: 5000 }).catch(open);
+    s = await read();
+    assert.equal(s.state, 'granted');
+    assert.match(s.status, /허용됨/);
+    assert.equal(s.request, false, '허용 상태에서는 요청 버튼 숨김');
+    assert.equal(s.deviceRow, true);
+    console.log(`[popup-layout] 설정 페이지 마이크 장치 목록: ${JSON.stringify(s.options)}`);
+    assert.ok(s.options.length >= 2, '시스템 기본 마이크 + 가짜 장치');
+    assert.equal(s.options[0][0], '');
+    assert.match(s.options[0][1], /^시스템 기본 마이크/);
+    assert.ok(s.options.slice(1).every(([v, label, disabled]) => v && v !== 'default' && label && !disabled), '"default" 가상 장치는 목록에서 뺌');
+
+    // 장치 선택 → 저장
+    const [deviceId, deviceLabel] = s.options[1];
+    await settings.select('#micDeviceSelect', deviceId);
+    await swWorker.evaluate(() => new Promise(r => setTimeout(r, 300)));
+    const stored = await storedSettings();
+    assert.equal(stored.micDeviceId, deviceId);
+    assert.equal(stored.micDeviceLabel, deviceLabel);
+    await open();
+    assert.equal((await read()).value, deviceId, '다시 열어도 선택 유지');
+
+    // 저장된 장치가 없음(분리) → "(연결 안 됨)" 비활성 항목 선택 + 기본 마이크 안내, 저장 값은 그대로
+    await setStoredSettings({ micDeviceId: 'e2e-unplugged-device', micDeviceLabel: 'E2E 분리된 마이크' });
+    await open();
+    s = await read();
+    assert.deepEqual(s.options.at(-1), ['e2e-unplugged-device', 'E2E 분리된 마이크 (연결 안 됨)', true]);
+    assert.equal(s.value, 'e2e-unplugged-device');
+    assert.match(s.message, /E2E 분리된 마이크/);
+    assert.match(s.message, /시스템 기본 마이크/);
+    assert.equal((await storedSettings()).micDeviceId, 'e2e-unplugged-device');
+    // 기본 마이크를 고르면 빈 값으로 저장, 안내 사라짐
+    await settings.select('#micDeviceSelect', '');
+    await swWorker.evaluate(() => new Promise(r => setTimeout(r, 300)));
+    assert.equal((await storedSettings()).micDeviceId, '');
+    s = await read();
+    assert.equal(s.message, '');
+
+    mkdirSync(OUT_DIR, { recursive: true });
+    const path = join(OUT_DIR, 'settings-page-mic.png');
+    await settings.screenshot({ path, fullPage: true });
+    console.log(`[popup-layout] 스크린샷 ${path}`);
+    assert.deepEqual(errors, [], '페이지 오류 없음');
+  } finally {
+    await setMicPermission(false);
+    await setStoredSettings({ micDeviceId: '', micDeviceLabel: '' });
+    await settings.close();
+    await page.bringToFront();
+  }
+});
+
+// 파일의 마지막 테스트: 권한이 없는 확장 출처에서 getUserMedia(마이크)를 부르면 헤드리스 Chrome은 권한 창 없이 거부하고 그 출처를 '차단'으로
+// 남기므로(프로필 상태) 다른 테스트에 영향이 없도록 맨 뒤에 둠
+test('마이크 권한이 없는 확장 출처의 getUserMedia(마이크)는 NotAllowedError로 거부된다(offscreen 문서와 같은 결과 → MIC_PERMISSION_DENIED). 차단(denied) 상태에서도 팝업 마이크 항목은 비활성 + 안내, 설정 페이지는 "거부됨"과 사이트 설정 안내', async () => {
+  await setMicPermission(false);
+  await reloadPopup();
+  assert.equal(await micPermissionState(), 'prompt');
+  const result = await page.evaluate(() => Promise.race([
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
+      .then((s) => { s.getTracks().forEach(t => t.stop()); return 'opened'; }, (e) => e.name),
+    new Promise(r => setTimeout(() => r('pending'), 3000))
+  ]));
+  console.log(`[popup-layout] 권한 없는 확장 출처의 마이크 getUserMedia: ${result}, 이후 권한 상태 ${await micPermissionState()}`);
+  assert.equal(result, 'NotAllowedError', '권한 창을 띄울 수 없는 문맥에서는 거부');
+  await reloadPopup();
+  const ui = await audioSourceUi();
+  assert.equal(ui.permission, 'denied');
+  assert.deepEqual(ui.options.map(o => o[2]), [false, true, true]);
+  assert.equal(ui.value, 'tab');
+  assert.equal(ui.hint.visible, true);
+
+  const settings = await browser.newPage();
+  try {
+    await settings.goto(`chrome-extension://${extensionId}/settings.html`, { waitUntil: 'load' });
+    await settings.waitForFunction(() => document.body.dataset.ready === 'true', { timeout: 10_000 });
+    const s = await settings.evaluate(() => ({ state: document.getElementById('micPermissionStatus').dataset.state, status: document.getElementById('micPermissionStatus').textContent.trim() }));
+    assert.equal(s.state, 'denied');
+    assert.match(s.status, /거부됨/);
+    assert.match(s.status, /chrome:\/\/settings\/content\/microphone/);
+    // 요청 버튼: 차단 상태에서는 권한 창 없이 거부 → 사이트 설정 안내
+    await settings.click('#requestMicButton');
+    await settings.waitForFunction(() => document.getElementById('micMessage').dataset.type === 'error', { timeout: 5000 });
+    const message = await settings.$eval('#micMessage', el => el.textContent.trim());
+    assert.match(message, /허용/);
+  } finally {
+    await settings.close();
+    await page.bringToFront();
+  }
+});

@@ -1,7 +1,8 @@
-import { MESSAGE_TYPES, RECORDING_STATES, SETTINGS, RECORDING_MODES, VIDEO_SETTINGS, SAVE_LOCATIONS, DEFAULT_SETTINGS, STORAGE_KEYS } from './constants.js';
+import { MESSAGE_TYPES, RECORDING_STATES, SETTINGS, RECORDING_MODES, VIDEO_SETTINGS, SAVE_LOCATIONS, DEFAULT_SETTINGS, STORAGE_KEYS, AUDIO_SOURCES } from './constants.js';
 import { formatTime, formatLabel } from './utils.js';
 import { loadSettings, saveSetting } from './storage.js';
 import { loadDirectoryHandle, queryFolderPermission, requestFolderPermission, folderDisplayName } from './save-location.js';
+import { AudioSourceControl } from './audio-source.js';
 
 // DOM 요소
 const skeleton = document.getElementById('skeleton');
@@ -23,9 +24,22 @@ const videoColumnNote = document.getElementById('videoColumnNote');
 const videoHint = document.getElementById('videoHint');
 const audioFormatNote = document.getElementById('audioFormatNote');
 const settingsButton = document.getElementById('settingsButton');
+const audioSourceSelect = document.getElementById('audioSourceSelect');
+const micPermissionHint = document.getElementById('micPermissionHint');
 
 // 녹음/녹화 중 비활성화할 설정 요소 목록
-const settingControls = () => [formatSelect, bitrateSelect, sampleRateSelect, modeSelect, videoFormatSelect].filter(Boolean);
+const settingControls = () => [formatSelect, bitrateSelect, sampleRateSelect, modeSelect, videoFormatSelect, audioSourceSelect].filter(Boolean);
+
+// 오디오 소스 (탭 / 마이크 / 탭+마이크): 팝업을 열 때 마이크 권한을 확인해, 허용되지 않았으면 마이크 항목을 비활성화하고 탭으로 녹화
+// (권한은 offscreen이 권한 창을 띄울 수 없어 설정 페이지에서 허용 → 한 줄 안내를 누르면 설정 페이지가 열림)
+const audioSourceControl = audioSourceSelect ? new AudioSourceControl({
+  select: audioSourceSelect,
+  hint: micPermissionHint,
+  save: saveAudioSourceSetting,
+  openSettings: openSettingsPage
+}) : null;
+// 설정 페이지에서 고른 마이크 장치 ('' = 시스템 기본 마이크). 녹화 시작 때 함께 보냄
+let currentMicDeviceId = '';
 
 // DOM 요소 유효성 검증
 function validateDOMElements() {
@@ -48,7 +62,9 @@ function validateDOMElements() {
     videoColumnNote,
     videoHint,
     audioFormatNote,
-    settingsButton
+    settingsButton,
+    audioSourceSelect,
+    micPermissionHint
   };
 
   const missingElements = [];
@@ -182,8 +198,25 @@ function showMainUI() {
 // 설정 페이지(options_page)에서 저장 폴더를 바꾸면 sync 미러가 바뀜 → 팝업을 다시 열지 않아도 다음 녹화 시작에 반영
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== 'sync' || !changes[STORAGE_KEYS.SETTINGS]) return;
-  applySaveLocationSetting({ ...DEFAULT_SETTINGS, ...(changes[STORAGE_KEYS.SETTINGS].newValue || {}) });
+  const settings = { ...DEFAULT_SETTINGS, ...(changes[STORAGE_KEYS.SETTINGS].newValue || {}) };
+  applySaveLocationSetting(settings);
+  // 설정 페이지에서 마이크 장치를 바꾸거나 다른 창에서 오디오 소스를 바꾼 경우
+  currentMicDeviceId = typeof settings.micDeviceId === 'string' ? settings.micDeviceId : '';
+  if (audioSourceControl) audioSourceControl.setStoredSource(settings.audioSource);
 });
+
+// 사용자가 고른 오디오 소스 저장 (권한이 없어 탭으로 되돌린 값은 저장하지 않음 - AudioSourceControl)
+async function saveAudioSourceSetting(key, value) {
+  try {
+    const success = await saveSetting(key, value);
+    if (!success) showMessage('설정 저장에 실패했습니다', 'error');
+    return success;
+  } catch (error) {
+    console.error('[Popup] 오디오 소스 저장 중 에러:', error);
+    showMessage('설정 저장 중 오류가 발생했습니다', 'error');
+    return false;
+  }
+}
 
 // 설정 페이지 열기 (헤더 ⚙ 버튼)
 async function openSettingsPage() {
@@ -384,6 +417,8 @@ async function startRecording() {
     const selectedFormat = formatSelect ? formatSelect.value : SETTINGS.DEFAULT_FORMAT;
     const selectedMode = modeSelect ? modeSelect.value : RECORDING_MODES.AUDIO_ONLY;
     const selectedVideoFormat = videoFormatSelect ? videoFormatSelect.value : VIDEO_SETTINGS.DEFAULT_FORMAT;
+    // 오디오 소스: 마이크 권한이 없으면 항상 탭 (AudioSourceControl이 결정)
+    const selectedAudioSource = audioSourceControl ? audioSourceControl.value : AUDIO_SOURCES.TAB;
 
     // Background에 녹음 시작 메시지 전송
     const response = await chrome.runtime.sendMessage({
@@ -393,7 +428,9 @@ async function startRecording() {
         format: selectedFormat,
         mode: selectedMode,
         videoFormat: selectedVideoFormat,
-        saveLocation: saveLocation.mode
+        saveLocation: saveLocation.mode,
+        audioSource: selectedAudioSource,
+        micDeviceId: currentMicDeviceId
       }
     });
 
@@ -411,8 +448,10 @@ async function startRecording() {
         startTime: Date.now(),
         mode: selectedMode
       });
-    if (saveLocation.notice) {
-      showMessage(saveLocation.notice, 'info', { sticky: true });
+    // 안내: 폴더 대신 다운로드로 저장 / 고른 마이크 대신 시스템 기본 마이크로 녹음 등 (Offscreen 시작 경고)
+    const notices = [saveLocation.notice, ...(Array.isArray(response.warnings) ? response.warnings : [])].filter(Boolean);
+    if (notices.length > 0) {
+      showMessage(notices.join(' '), 'info', { sticky: true });
     }
   } catch (error) {
     console.error('녹음 시작 실패:', error);
@@ -629,7 +668,13 @@ async function loadUserSettings() {
       videoFormatSelect.value = settings.videoFormat || VIDEO_SETTINGS.DEFAULT_FORMAT;
     }
     applySaveLocationSetting(settings);
+    currentMicDeviceId = typeof settings.micDeviceId === 'string' ? settings.micDeviceId : '';
     updateModeVisibility();
+    // 마이크 권한 확인 후 오디오 소스 표시 (UI를 보이기 전에 끝나므로 마이크 항목이 잠깐 활성으로 보이지 않음)
+    if (audioSourceControl) {
+      const permission = await audioSourceControl.init(settings.audioSource);
+      console.log('[Popup] 마이크 권한:', permission, '| 오디오 소스:', audioSourceControl.value, '(저장 값', settings.audioSource, ')');
+    }
   } catch (error) {
     console.error('[Popup] 설정 로드 실패:', error);
   }

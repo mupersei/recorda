@@ -20,12 +20,16 @@
   - fMP4(조각): 약 2초마다 `moof`+`mdat` 조각을 기록합니다. 브라우저가 비정상 종료돼도 저장 폴더에 남은 임시 파일(`*.crswap`)의
     이름을 `.mp4`로 바꾸면 그때까지 기록된 조각을 재생할 수 있습니다. → [fMP4 (조각 MP4)](#fmp4-조각-mp4)
 - 녹음 중에도 탭 소리는 그대로 들립니다 (AudioContext 루프백).
+- 오디오 소스: **탭**(기본, 탭 소리) / **마이크**(설정 페이지에서 고른 시스템 마이크) / **탭+마이크**(두 소리를 섞음). 영상은 언제나 녹화를 시작한
+  탭에서 녹화하고, 오디오 소스는 오디오 파일과 영상 파일 속 오디오 모두에 적용됩니다. 마이크 권한은 설정 페이지에서 한 번 허용하며, 허용하기 전에는
+  팝업의 마이크 항목이 비활성입니다. → [오디오 소스](#오디오-소스-탭--마이크--탭마이크)
 - 일시정지 / 재개: 녹화 중 "일시정지"를 누르면 캡처는 유지한 채 인코딩만 멈추고, "재개"하면 같은 파일에 이어서 기록합니다.
   일시정지 구간은 파일에 남지 않으며(8초 녹화 + 4초 일시정지 + 4초 녹화 → 약 12초 파일), 일시정지 중에도 중지할 수 있습니다.
 - 저장 위치: 기본은 Chrome 다운로드 폴더(`chrome.downloads`). 설정 페이지(팝업 ⚙)에서 폴더를 한 번 고르면 녹화 파일을 그 폴더에
   **직접 기록**해 다운로드 복사 단계(1080p 1시간 기준 약 49초)가 없어집니다. MP4·MOV·fMP4 영상은 녹화하는 동안 그 폴더의 최종 파일에
   바로 쓰입니다. → [저장 폴더](#저장-폴더-설정-페이지-file-system-access-api)
-- 모든 설정(모드, 포맷, 비트레이트, 샘플레이트, 저장 위치 모드·폴더 이름)은 `chrome.storage.sync`에 저장됩니다. 폴더 핸들 자체는 IndexedDB에 보관합니다.
+- 모든 설정(모드, 포맷, 비트레이트, 샘플레이트, 오디오 소스, 마이크 장치 ID·이름, 저장 위치 모드·폴더 이름)은 `chrome.storage.sync`에 저장됩니다.
+  폴더 핸들 자체는 IndexedDB에 보관하고, 마이크 권한 상태는 저장하지 않고 매번 브라우저에 묻습니다.
 
 ## 요구 사항
 
@@ -41,7 +45,9 @@
 ## 사용 방법
 
 1. 녹화할 탭에서 미디어를 재생한 뒤 확장 아이콘 클릭
-2. 녹화 모드 선택 → 왼쪽 "영상" 열에서 영상 포맷(MP4 / fMP4 (조각) / MOV / AVI), 오른쪽 "오디오" 열에서 오디오 포맷·MP3 비트레이트·샘플레이트 선택
+2. 녹화 모드 선택 → 왼쪽 "영상" 열에서 영상 포맷(MP4 / fMP4 (조각) / MOV / AVI), 오른쪽 "오디오" 열에서 오디오 소스(탭 / 마이크 / 탭+마이크)·
+   오디오 포맷·MP3 비트레이트·샘플레이트 선택. 마이크를 쓰려면 먼저 설정 페이지(⚙)의 "마이크" 카드에서 "마이크 권한 요청"으로 허용하고 녹음할
+   마이크를 고릅니다(권한이 없으면 팝업에 "마이크 권한: 설정에서 허용" 안내가 보이고, 누르면 설정 페이지가 열림)
 3. "녹화 시작" → (필요하면 "일시정지" / "재개") → "녹화 중지"
 4. 파일은 설정 페이지에서 정한 위치(기본: 다운로드 폴더, 또는 고른 폴더)에 저장되고, 완료 메시지에 저장된 곳이 표시됩니다
    (`recorda_YYYYMMDD_HHMMSS.확장자`, 녹화 **시작** 시각 기준. 분리 저장의 두 파일은 같은 이름을 공유)
@@ -52,38 +58,45 @@
 - 맨 위 한 줄: 제목, 상태(대기 중 / 녹화 중... / 일시정지 / 파일 생성 중...), 설정(⚙) 버튼. 세 요소는 같은 높이(24px)의 줄 상자를 쓰는
   flex 행에서 세로 중앙선을 공유합니다. ⚙는 상태 줄과 같은 높이의 24px 정사각형 버튼(위쪽 여백·위치 보정 없음)이고, 오른쪽 끝이 아래 콘텐츠
   (녹화 모드 선택 상자, 녹화 버튼)의 오른쪽 끝과 맞습니다. 그 아래 경과 시간과 녹화 모드(전체 폭).
-- 녹화 모드 아래 두 열: **왼쪽 "영상"**(영상 포맷), **오른쪽 "오디오"**(오디오 포맷, MP3 비트레이트, 샘플레이트). 폭 420px.
+- 녹화 모드 아래 두 열: **왼쪽 "영상"**(영상 포맷), **오른쪽 "오디오"**(오디오 소스, 오디오 포맷, MP3 비트레이트, 샘플레이트). 폭 420px.
 - 모드별 활성 규칙 (녹화·일시정지·처리 중에는 모든 설정이 비활성):
 
-| 모드 | 영상 열 | 오디오 포맷 | 비트레이트 / 샘플레이트 |
-|---|---|---|---|
-| 오디오만 녹음 | 비활성(회색) + "영상 녹화 안 함" | 활성 | 활성 |
-| 영상 + 오디오 (파일 1개) | 활성 | 비활성 + "영상 파일에 포함" | 활성 (영상 파일 속 MP3에 적용) |
-| 영상 + 오디오, 오디오 별도 저장 | 활성 | 활성 | 활성 |
+| 모드 | 영상 열 | 오디오 소스 | 오디오 포맷 | 비트레이트 / 샘플레이트 |
+|---|---|---|---|---|
+| 오디오만 녹음 | 비활성(회색) + "영상 녹화 안 함" | 활성 | 활성 | 활성 |
+| 영상 + 오디오 (파일 1개) | 활성 | 활성 (영상 파일 속 오디오) | 비활성 + 라벨 줄 오른쪽 "영상 파일에 포함" | 활성 (영상 파일 속 MP3에 적용) |
+| 영상 + 오디오, 오디오 별도 저장 | 활성 | 활성 (두 파일 모두) | 활성 | 활성 |
+
+- 오디오 소스의 "마이크"·"탭+마이크"는 마이크 권한이 허용됐을 때만 고를 수 있습니다. 권한이 없으면 두 항목이 비활성(`<option disabled>`)이고 값은
+  "탭"으로 고정되며, 선택 상자 아래에 한 줄 안내 **"마이크 권한: 설정에서 허용"**(누르면 설정 페이지)이 보입니다 → [오디오 소스](#오디오-소스-탭--마이크--탭마이크).
 
 - 저장 위치는 팝업에 표시하지 않습니다(설정 페이지에서만 확인·변경). 녹화가 끝나면 완료 메시지에 파일이 저장된 곳을 적습니다
   (`녹화가 완료되어 2개 파일이 'Recordings'에 저장되었습니다. (MP4, WAV)` / `... 다운로드 폴더에 저장되었습니다.`).
-- 높이(대기·녹화 중·일시정지 동일, Chrome 팝업 최대 600px): 오디오만 437px, 영상+오디오 454px, 분리 저장 437px. 4줄짜리 완료/오류 메시지가
-  붙는 가장 긴 상태는 519~536px입니다(Noto Sans KR 기준). 줄 높이와 선택 상자 높이를 고정해 메시지를 뺀 부분의 높이는 사용자의 한글 폰트
-  (맑은 고딕, Apple SD Gothic Neo, Noto Sans CJK 등)의 기본 줄 간격과 무관합니다(DejaVu·Noto Sans KR에서 같은 값). 메시지 줄 수만 글꼴 폭에 따라 달라집니다.
+- 높이(대기·녹화 중·일시정지 동일, Chrome 팝업 최대 600px): 마이크 권한이 없을 때(한 줄 안내 표시) 오디오만 507px, 영상+오디오 508px, 분리 저장
+  507px, 권한이 있을 때(안내 없음) 491 / 492 / 491px. 4줄짜리 완료/오류 메시지가 붙는 가장 긴 상태는 589~590px입니다(Noto Sans KR 기준, 오디오 소스를
+  넣기 전 437 / 454 / 437px, 가장 긴 상태 519~536px). 오디오 소스(+54px)와 안내(+16px)를 넣으면서 영상+오디오 모드의 "영상 파일에 포함" 안내를
+  오디오 포맷 라벨 줄 오른쪽으로 옮겨(-17px) 모드를 바꿔도 높이가 같고 가장 긴 상태도 600px 안에 들어갑니다. 줄 높이와 선택 상자 높이를 고정해
+  메시지를 뺀 부분의 높이는 사용자의 한글 폰트(맑은 고딕, Apple SD Gothic Neo, Noto Sans CJK 등)의 기본 줄 간격과 무관합니다(DejaVu·Noto Sans KR에서
+  같은 값). 메시지 줄 수만 글꼴 폭에 따라 달라집니다.
 
 ## 아키텍처
 
 ```
 popup.js ──START/PAUSE/RESUME/STOP_RECORDING──▶ background.js ──START/PAUSE/RESUME/STOP_CAPTURE──▶ offscreen.js
    ▲                                              │  (tabCapture.getMediaStreamId,                     │
-   │ STATE_CHANGED / UPDATE_TIME                  │   recording-plan 검증, 상태 머신,                  │ getUserMedia(tab audio[+video])
+   │ STATE_CHANGED / UPDATE_TIME                  │   recording-plan 검증, 상태 머신,                  │ getUserMedia(tab audio[+video]) [+ 마이크]
    └──────────────────────────────────────────────┤   chrome.downloads 저장)                           │
                                                   ◀──DOWNLOAD_FILE / RECORDING_COMPLETE / HEARTBEAT───┘
 ```
 
 | 메시지 | 방향 | 내용 |
 |---|---|---|
-| `START_RECORDING` / `STOP_RECORDING` | Popup → Background | 녹화 시작(IDLE에서만, `saveLocation: 'folder' \| 'downloads'`) / 중지(RECORDING·PAUSED → PROCESSING) |
+| `START_RECORDING` / `STOP_RECORDING` | Popup → Background | 녹화 시작(IDLE에서만, `saveLocation: 'folder' \| 'downloads'`, `audioSource: 'tab' \| 'mic' \| 'tab+mic'`, `micDeviceId`, 응답 `warnings[]`) / 중지(RECORDING·PAUSED → PROCESSING) |
 | `PAUSE_RECORDING` / `RESUME_RECORDING` | Popup → Background | 일시정지(RECORDING → PAUSED) / 재개(PAUSED → RECORDING). 응답에 최신 상태 포함 |
-| `START_CAPTURE` / `STOP_CAPTURE` | Background → Offscreen | 캡처·인코딩 시작(`saveToFolder: true/false`) / 중지 후 파일 생성 |
+| `START_CAPTURE` / `STOP_CAPTURE` | Background → Offscreen | 캡처·인코딩 시작(`saveToFolder: true/false`, `plan.captureTabAudio`·`captureMic`·`micDeviceId`, 탭에서 캡처할 것이 없으면(오디오만 + 마이크) `streamId: null`, 응답 `warnings[]`) / 중지 후 파일 생성 |
+| `RECORDING_STARTED` | Offscreen → Background | 캡처 시작 완료 (`data.warnings`: 고른 마이크 대신 시스템 기본 마이크로 녹음 등) |
 | `DOWNLOAD_FILE` | Offscreen → Background | 다운로드 폴더로 저장할 파일의 Blob URL (폴더에 직접 저장한 파일은 보내지 않음) |
-| `RECORDING_COMPLETE` | Offscreen → Background | 결과 파일 목록 `files[]`(`format`: 녹화 포맷(fMP4는 `fmp4`), `label`: 표시 이름(fMP4는 `MP4`), `savedTo: 'folder' \| 'downloads'`, `location`: 폴더 이름), `savedTo` 요약(`folder`/`downloads`/`mixed`), `warning`, 단계별 `timings` |
+| `RECORDING_COMPLETE` | Offscreen → Background | 결과 파일 목록 `files[]`(`format`: 녹화 포맷(fMP4는 `fmp4`), `label`: 표시 이름(fMP4는 `MP4`), `savedTo: 'folder' \| 'downloads'`, `location`: 폴더 이름), `savedTo` 요약(`folder`/`downloads`/`mixed`), `warning`(경고를 이은 문장)·`warnings[]`, 단계별 `timings` |
 | `RECORDING_ERROR` | Offscreen → Background | 시작·중지 실패, 또는 녹화 중 영상 파일 쓰기 실패로 녹화를 스스로 멈춘 경우(`ERROR_MESSAGES.VIDEO_WRITE_FAILED` + 원인) |
 | `PAUSE_CAPTURE` / `RESUME_CAPTURE` | Background → Offscreen | 인코더 입력 중단 / 재개 (캡처 스트림·루프백·하트비트는 유지) |
 | `RECORDING_HEARTBEAT` | Offscreen → Background | 20초마다. SW 상태 복구용 (`paused`, `pausedAt`, `pausedTotalMs` 포함) |
@@ -93,10 +106,11 @@ popup.js ──START/PAUSE/RESUME/STOP_RECORDING──▶ background.js ──ST
 |---|---|
 | `background.js` | 상태 관리, 녹화 계획 검증, Offscreen 생명주기, `chrome.downloads`로 파일 저장 |
 | `offscreen.js` | 탭 캡처, AudioWorklet 기반 PCM 추출, 오디오/영상 인코더 구동, 파일 생성 (저장 폴더 직접 기록 또는 다운로드) |
-| `popup.html` / `popup.js` | 녹화 UI (영상/오디오 두 열, 녹화 시작 시 폴더 권한 확인. 저장 위치는 표시하지 않음) |
-| `settings.html` / `settings.js` | 설정 페이지(`options_page`): 현재 저장 위치 표시(저장 위치를 보여 주는 유일한 화면), 저장 폴더 선택·권한 상태·권한 다시 요청·기본으로 되돌리기 |
+| `popup.html` / `popup.js` | 녹화 UI (영상/오디오 두 열, 오디오 소스와 마이크 권한 안내, 녹화 시작 시 폴더 권한 확인. 저장 위치는 표시하지 않음) |
+| `settings.html` / `settings.js` | 설정 페이지(`options_page`): 현재 저장 위치 표시(저장 위치를 보여 주는 유일한 화면), 저장 폴더 선택·권한 상태·권한 다시 요청·기본으로 되돌리기, 마이크 카드(권한 요청·상태, 녹음할 마이크 선택) |
+| `audio-source.js` | 오디오 소스 공용 로직: 마이크 권한 확인(Permissions API → `enumerateDevices` 폴백)·요청·변경 구독, 장치 목록, 팝업 선택 규칙(`AudioSourceControl`), 설정 페이지 마이크 카드(`MicSettingsSection`) |
 | `save-location.js` | 폴더 핸들 IndexedDB 보관, `chrome.storage.sync` 미러, 권한 조회/요청, 쓰기 확인, 겹치지 않는 파일명 |
-| `recording-plan.js` | 모드·포맷 → 캡처 여부와 출력 파일 목록(순수 함수) |
+| `recording-plan.js` | 모드·포맷·오디오 소스 → 캡처 여부(`captureVideo`, `captureTabAudio`, `captureMic`, `micDeviceId`)와 출력 파일 목록(순수 함수), `planCapturesTab` |
 | `encoders.js` | 오디오 단독 파일용 스트리밍 MP3/WAV 인코더 (기존) |
 | `container-audio-encoder.js` | 영상 컨테이너에 담을 MP3 프레임 생성 (작성기로 바로 넘기거나 AVI 청크 저장소에 쌓음) |
 | `video-recorder.js` | `VideoTrackEncoder`(WebCodecs H.264, 원본 타임스탬프 + `adjustTimestamp` 보정, VideoFrame 수명 관리·집계 `stats`) + `VideoRecordingSession`(MP4/MOV/fMP4 직접 기록, AVI 머싱, 녹화 중 쓰기 실패 알림, 시작 실패 정리 `dispose`) |
@@ -418,6 +432,74 @@ Background ──▶ START_CAPTURE { saveToFolder } ──▶ Offscreen: Indexed
   비례해 커집니다(10분·60분 실측은 [녹화 종료 후 파일 생성 시간](#녹화-종료-후-파일-생성-시간)).
   실제 로컬 폴더에서는 Chrome이 파일을 닫을 때 안전 검사(Safe Browsing)를 할 수 있어 OPFS 루트보다 조금 더 걸릴 수 있습니다(미측정).
 
+### 오디오 소스 (탭 / 마이크 / 탭+마이크)
+
+팝업 오른쪽 "오디오" 열 맨 위의 **오디오 소스**로 녹음할 소리를 고릅니다. 영상은 어떤 소스든 언제나 녹화를 시작한 탭에서 녹화하고, 오디오 소스는 모든
+모드에 적용됩니다(오디오 파일, 영상 파일 속 MP3 모두 같은 소리). 선택은 `settings.audioSource`, 설정 페이지에서 고른 장치는 `settings.micDeviceId`
+(`''` = 시스템 기본 마이크)·`micDeviceLabel`로 `chrome.storage.sync`에 저장됩니다.
+
+| 오디오 소스 | 탭 캡처 요청 (`tabCapture` 스트림) | 마이크 | 녹화 중 탭 소리 | 비고 |
+|---|---|---|---|---|
+| 탭 (기본) | 탭 오디오 (+ 영상 모드면 영상) | 쓰지 않음 | 루프백으로 그대로 들림 | 기존 동작 |
+| 마이크 | 영상 모드에서만 영상(탭 오디오 요청 없음). 오디오만 모드는 스트림 ID도 발급하지 않음 | 설정에서 고른 장치 | 캡처하지 않으므로 평소처럼 들림 | 오디오만 모드는 탭과 무관 (`chrome://` 탭에서도 시작 가능, 탭을 닫아도 계속) |
+| 탭+마이크 | 탭 오디오 (+ 영상 모드면 영상) | 설정에서 고른 장치 | 루프백으로 들림 | **헤드폰 사용 권장 (에코 방지)** |
+
+- **권한**: offscreen 문서는 화면에 보이지 않아 권한 창을 띄울 수 없습니다(권한이 없으면 `getUserMedia`가 창 없이 `NotAllowedError`). 그래서 설정
+  페이지 "마이크" 카드의 **"마이크 권한 요청"**(`getUserMedia({audio: true})` 후 트랙 즉시 중지)으로 확장 출처(`chrome-extension://<id>`)에 한 번 허용받습니다.
+  같은 출처라 팝업·offscreen 문서에도 그대로 적용됩니다. 권한 상태는 `navigator.permissions.query({name: 'microphone'})`(쓸 수 없으면 `enumerateDevices`가
+  장치 이름을 알려 주는지)로 그때그때 확인하고 저장하지 않습니다(프로필마다 다르고 sync로 다른 PC에 퍼지면 안 됨). manifest 권한은 추가하지 않습니다
+  (확장 페이지의 `getUserMedia`는 출처 단위 사이트 권한으로 동작, `audioCapture`는 Chrome 앱 전용).
+- **팝업 비활성 규칙** (`audio-source.js`의 `resolveAudioSourceSelection` / `AudioSourceControl`): 팝업을 열 때 권한을 확인하고 UI를 보이기 전에 반영합니다.
+  - granted가 아니면(prompt·denied·확인 불가) "마이크"·"탭+마이크" `<option>`을 `disabled`로 만들고 값을 "탭"으로 고정, 선택 상자 아래에 한 줄 안내
+    "마이크 권한: 설정에서 허용"(버튼, 누르면 `chrome.runtime.openOptionsPage()`)을 보입니다. 녹화 시작은 항상 `audioSource: 'tab'`으로 요청합니다.
+  - 권한 때문에 되돌린 값은 저장하지 않습니다(저장된 `audioSource`는 그대로) → 권한을 허용하면 이전 선택(예: 탭+마이크)이 돌아옵니다.
+  - 팝업이 열린 동안 권한이 바뀌면(PermissionStatus `change`) 바로 다시 그리고, 코드로 비활성 항목이 선택되어도 저장하지 않고 되돌립니다.
+  - 녹화·일시정지·처리 중에는 다른 설정처럼 선택 상자 자체가 비활성입니다.
+- **장치 선택** (설정 페이지, `MicSettingsSection`): 권한을 얻은 뒤에만 `enumerateDevices()`의 오디오 입력으로 목록을 만듭니다("시스템 기본 마이크
+  (<기본 장치 이름>)" + 장치들. Chrome의 `default` 가상 장치는 목록에서 빼고 그 이름만 기본 항목에 표시). 고른 장치는 `micDeviceId`·`micDeviceLabel`로
+  저장하고, `devicechange`·권한 변경 때 목록을 다시 읽습니다. 저장된 장치가 지금 없으면(USB 분리, 다른 PC에서 동기화된 ID) "<이름> (연결 안 됨)" 비활성
+  항목으로 선택해 두고 시스템 기본 마이크로 녹음한다고 안내합니다. 저장 값은 사용자가 바꿀 때까지 유지하므로 다시 연결하면 그 장치로 돌아옵니다.
+- **캡처** (offscreen): 탭 스트림 ID를 먼저 쓴 뒤(발급 직후 만료 방지) 마이크를 엽니다:
+  `getUserMedia({ audio: { deviceId: { exact: <id> }, echoCancellation: true, noiseSuppression: true, autoGainControl: true } })`(장치 지정이 없으면 `deviceId` 없이).
+  - `exact` 장치가 없으면(`OverconstrainedError`·`NotFoundError`) 시스템 기본 마이크로 다시 열고 경고합니다: 시작 때 START_RECORDING 응답 `warnings` →
+    팝업 안내 "…시스템 기본 마이크로 녹음합니다." (`RECORDING_STARTED.data.warnings`도 같음), 완료 때 `RECORDING_COMPLETE.warning`·`warnings` "…녹음했습니다.".
+  - 권한 없음(`NotAllowedError`) → `MIC_PERMISSION_DENIED`, 기본 마이크도 없음 → `MIC_DEVICE_NOT_FOUND`, 장치를 열 수 없음(`NotReadableError` 등) →
+    `MIC_UNAVAILABLE`(+ 원인)로 시작에 실패하고 이미 연 탭 캡처 트랙을 멈춥니다(바로 다시 녹화를 시작할 수 있음).
+- **오디오 그래프**:
+
+  ```
+  탭 오디오 ─ MediaStreamSource ─┬─▶ destination (스피커: 녹화 중에도 탭 소리가 들림)
+                                 └─▶ GainNode(1) ──┐
+  마이크 ──── MediaStreamSource ───▶ GainNode(1) ──┴─▶ AudioWorklet (합산 → PCM, 일시정지 경계) ─▶ destination (출력을 쓰지 않음 = 무음)
+  ```
+
+  - 마이크는 destination에 연결하지 않습니다(스피커로 나가면 에코·하울링). 워크릿은 출력에 아무것도 쓰지 않으므로 destination 연결로 소리가 나지 않습니다
+    (렌더링을 계속 끌어오기 위한 연결).
+  - 같은 워크릿 입력으로 들어온 연결은 Web Audio가 합산하고 모노 마이크는 스테레오로 업믹스합니다. 워크릿 이후(인코더, 일시정지 경계, A/V 정렬)는
+    기존과 같아 일시정지/재개가 섞인 소리 전체에 똑같이 적용됩니다(일시정지 중에도 탭·마이크 캡처는 유지).
+  - 샘플레이트: 마이크는 보통 48 kHz지만 `MediaStreamSource`가 AudioContext 샘플레이트(설정 값 44.1 / 48 kHz)로 리샘플링하므로 WAV/MP3 헤더와 인코더는
+    항상 `audioContext.sampleRate`입니다(E2E: 48 kHz 모노 가짜 마이크 → 44.1 kHz 스테레오 WAV).
+  - 소스별 GainNode 값은 `MIC_SETTINGS.SOURCE_GAIN`(1 = 원음 합산)입니다.
+- **녹화 중 마이크 끊김**(트랙 `ended`, USB 분리 등): 마이크가 유일한 소스(오디오만 + 마이크)면 그때까지의 녹음으로 파일을 저장하고
+  (`MIC_DISCONNECTED_STOPPED`), 탭 소리나 영상이 있으면 계속 녹화하고 완료 경고(`MIC_DISCONNECTED`)를 붙입니다. 정상 중지·시작 실패·탭 종료로 인한
+  마무리 모두 `cleanup()`에서 마이크 트랙을 멈춥니다(마이크 사용 표시가 꺼짐).
+- **탭이 닫힐 때**: 탭을 캡처하는 녹화(탭 오디오 또는 영상)는 기존처럼 마무리하고, 오디오만 + 마이크는 탭과 무관하므로 계속합니다.
+- 실측 (E2E, 헤드리스 Chrome 148, 720p, 10초 녹화(대체 시나리오 6초). 가짜 마이크 = 2.5 kHz 진폭 변조 사인 파일, 탭 = 440 Hz ± 200 Hz 가짜 오실레이터.
+  대역 음량은 ffmpeg volumedetect, "최대 / 평균"):
+
+| 시나리오 | 결과 파일 | 마이크 대역(2.5 kHz) | 탭 대역(≤800 Hz) | 비고 |
+|---|---|---|---|---|
+| `audio-mic-wav` (마이크, 오디오만, 고른 장치 `exact`) | WAV 10.54초, 44.1 kHz 스테레오 | -5.6 / -14.3 dB | -39.8 / -48.7 dB | 탭 getUserMedia 없음, 마이크 48 kHz 모노 → 44.1 kHz |
+| `audio-mix-mp3` (탭+마이크, 시스템 기본) | MP3 10.58초, 44.1 kHz | -5.7 / -15.2 dB | -6.3 / -10.8 dB | 두 소리 모두 들어 있음 |
+| `split-mix-mp4-wav` (탭+마이크, 분리 저장) | MP4 10.69초 + WAV 10.62초 | -5.1 / -15.2 · -5.7 / -14.7 dB | -4.6 / -10.8 · -6.0 / -10.4 dB | A/V 길이 차 0.06초 |
+| `video-mic-mp4` (마이크, 영상 파일 1개) | MP4 10.63초 (영상 314프레임) | -6.1 / -14.7 dB | -23.2 / -49.0 dB | 탭 오디오 요청 없음, A/V 길이 차 0.00초 |
+| `audio-mic-fallback-wav` (저장된 장치 없음) | WAV 6.55초 | -5.6 / -13.8 dB | -39.8 / -48.2 dB | `exact` → OverconstrainedError → 기본 장치, 시작 안내·완료 경고 |
+
+  탭 대역의 최대값(-23 dB 등)은 시작 순간의 짧은 과도음이고 평균은 -48 dB 이하라 탭 소리가 없습니다. 섞은 파일의 전체 최대값은 0 dB(두 소리의 합이
+  최대 크기에 닿음)였습니다 → 알려진 제한 참고. 모든 마이크 시나리오에서 offscreen의 마이크 요청 시점 권한은 granted였고 중지 후 마이크 트랙은 `ended`였습니다.
+  `--noFakeUi`(권한 창 자동 수락 없이, 설정 페이지에서 허용해 둔 상태를 CDP로 만든 뒤)로 실행한 `video-mic-mp4`도 같은 결과여서, 권한 창을 띄울 수 없는
+  문서가 미리 받아 둔 확장 출처의 권한만으로 마이크를 연다는 것을 확인했습니다.
+
 ### Service Worker 수명 대응
 
 MV3 Service Worker는 유휴 30초 후 종료될 수 있고, 패키지 설치에서는 `chrome.alarms` 최소 주기가 30초입니다.
@@ -427,7 +509,8 @@ MV3 Service Worker는 유휴 30초 후 종료될 수 있고, 패키지 설치에
   SW를 깨우고, 상태를 잃었으면 RECORDING 또는 PAUSED로 복구시킵니다.
 - 다운로드 대기 목록도 `chrome.storage.session`에 두어 SW가 재시작된 뒤 도착한 `downloads.onChanged`도 처리하며, 타임아웃은 `chrome.alarms`로 걸어 둡니다.
 - 팝업은 `effectiveStartTime`(startTime + 누적 일시정지 시간) 기준 자체 타이머로 경과 시간을 표시하고, 일시정지 중에는 타이머를 멈춥니다.
-- 녹화 중인 탭이 닫히면(`tabs.onRemoved`, 트랙 `onended`) 일시정지 중이어도 자동으로 녹화를 마무리합니다.
+- 녹화 중인 탭이 닫히면(`tabs.onRemoved`, 트랙 `onended`) 일시정지 중이어도 자동으로 녹화를 마무리합니다. 탭을 캡처하지 않는 녹화(오디오만 + 마이크)는
+  탭과 무관하므로 계속합니다.
 
 ## 테스트
 
@@ -476,6 +559,24 @@ npm test
   조각 기록, `outputSinkFactory`를 시작 때 실제 포맷·MIME으로 요청(fmp4 → `.mp4`, `video/mp4`), AVI는 기존 중지 시 머싱, 녹화 중 쓰기 실패 →
   `onError(VIDEO_WRITE_FAILED)`·`stop()` 거부·실패 파일 삭제, `adjustTimestamp` = 메모리 경로 보정, fMP4 일시정지 연속성.
 
+- 오디오 소스:
+  - 계획(`recording-plan.test.js`): 3가지 소스 × 3가지 모드의 `captureTabAudio`·`captureMic`·`captureVideo`·`micDeviceId`, 출력 파일은 소스와 무관,
+    잘못된 소스 거부, `planCapturesTab`(오디오만 + 마이크만 탭 캡처 없음).
+  - 공용 로직(`audio-source.test.js`, 가짜 `navigator.permissions`/`mediaDevices`(`tests/helpers/fakes.js`)와 최소 가짜 DOM(`tests/helpers/fake-dom.js`)):
+    권한 확인(Permissions API, `enumerateDevices` 폴백, 확인 불가 = prompt)·변경 구독·요청(트랙 즉시 중지, 거부/차단/마이크 없음), 장치 목록(`default`
+    가상 장치 제외). 팝업: 권한이 없으면 마이크 항목 disabled·탭으로 고정·안내 표시·저장 값 유지, granted면 모두 활성·저장된 선택 표시, 선택 저장,
+    권한 없이 들어온 값 되돌림, 안내 클릭 → 설정 페이지, 열린 동안 권한 변경 반영. 설정 페이지: 요청 흐름, 장치 목록, 선택 저장(ID + 이름), 사라진 장치
+    "(연결 안 됨)" + 안내(저장 값 유지)·다시 연결 시 복귀, `devicechange`, 거부 안내, 요청 중 중복 방지.
+  - offscreen(`offscreen.test.js`, 노드 연결을 기록하는 가짜 AudioContext): 마이크 getUserMedia 제약(exact + 에코 제거·잡음 억제·자동 음량, 장치 없으면
+    deviceId 없음, 샘플레이트 제약 없음), 탭 스트림 다음에 마이크, 그래프(소스마다 GainNode(1) → 공용 워크릿, 탭만 destination, 마이크는 워크릿 외 경로로
+    destination에 닿지 않음), 마이크만이면 탭 오디오 요청 없음(오디오만은 탭 getUserMedia 자체가 없음), WAV 헤더 샘플레이트 = AudioContext(48 kHz 마이크),
+    `exact` 실패(OverconstrainedError/NotFoundError) → 기본 장치 + 시작·완료 경고, NotAllowedError → MIC_PERMISSION_DENIED + 탭 트랙 정리 + 다음 녹화 가능,
+    NotFoundError/NotReadableError → MIC_DEVICE_NOT_FOUND/MIC_UNAVAILABLE, 탭 종료·정상 중지 때 마이크 트랙 중지, 마이크 끊김(유일한 소스 → 마무리, 아니면
+    계속 + 경고), 일시정지/재개(공용 워크릿), 하트비트 계획, 탭이 필요한데 스트림 ID 없음 → 실패.
+  - Background(`background-audio-source.test.js`): `audioSource`·`micDeviceId` 전달(요청 > 저장된 설정 > 기본, 빈 장치 ID 존중), 오디오만 + 마이크는
+    `getMediaStreamId`를 부르지 않고 `streamId: null`(캡처할 수 없는 탭에서도 시작), 영상 모드는 마이크여도 스트림 ID 발급, Offscreen 시작 경고 →
+    START_RECORDING 응답 `warnings`, 마이크 권한 실패 전달 + IDLE, 잘못된 소스 거부, 탭 닫힘(마이크만 녹음은 계속).
+
 ### E2E (실제 Chrome)
 
 ```bash
@@ -496,6 +597,14 @@ cd e2e && node run.mjs --duration=10 --long=60 --only=video-mp4,split-avi-wav
   없음(기본·폴더 설정, 대기·녹화 중·일시정지), 녹화 시작 시 폴더 권한 확인(granted / 요청 / 거부 → 다운로드 안내 / 핸들 없음), 설정 페이지(폴더 선택은
   헤드리스에서 창을 띄울 수 없어 `showDirectoryPicker`를 OPFS 하위 폴더를 돌려주는 스텁으로 대체, 쓰기 불가 폴더 거부, 권한 다시 요청, 되돌리기)도
   검사하고 `e2e/output/popup-<모드>.png`(대기), `popup-<모드>-RECORDING.png`(녹화 중), `settings-page.png` 스크린샷을 남깁니다.
+  오디오 소스: 이 테스트는 권한 창 자동 수락 없이(`--use-fake-device-for-media-stream`만) Chrome을 띄우므로 확장 출처의 마이크 권한이 처음에 prompt입니다.
+  권한이 없을 때 마이크·탭+마이크 `<option disabled>`, 저장 값이 마이크여도 "탭", 한 줄 안내(한 줄 높이·잘림 없음, 클릭 → 설정 페이지, 설정 페이지 마이크
+  카드 "확인 필요"), 녹화 시작 요청 `audioSource: 'tab'`. CDP `Browser.grantPermissions`(audioCapture)로 허용하면 모두 활성·안내 숨김, 고른 소스가
+  storage.sync에 저장되어 다시 열어도 유지, 녹화 시작 요청에 소스와 `micDeviceId`, 녹화 중 비활성, 같은 출처의 마이크 getUserMedia가 권한 창 없이 열림,
+  권한 높이(491/492/491px)와 `popup-VIDEO_AUDIO_SPLIT-mic-granted.png`. 권한을 회수하면 다시 탭(저장 값 유지). 설정 페이지 마이크 카드(저장 위치 아래,
+  허용 시 가짜 장치 목록·선택 저장·"(연결 안 됨)" 항목과 안내, 헤드폰 권장 안내, `settings-page-mic.png`). 마지막 테스트는 권한 없는 확장 출처의 마이크
+  getUserMedia가 `NotAllowedError`로 거부되고(offscreen과 같은 결과) 차단(denied) 상태에서도 팝업 항목 비활성·설정 페이지 "거부됨"인지 확인합니다
+  (헤드리스는 거부 결과를 프로필에 남기므로 맨 뒤).
   컨테이너에 한글 폰트가 없으면 글자가 네모로 그려지고 높이도 실제와 달라지므로 `FONTCONFIG_FILE`로 한글 폰트(예: Noto Sans KR)를 포함한
   fontconfig 설정을 지정해 실행하는 것을 권장합니다.
 - 시나리오: 오디오만(mp3/wav), 영상+오디오(mp4/mov/avi/fmp4), 분리 저장(mp4+mp3, avi+wav), 녹화 중 탭 크기 변경, 1080p 60초 장시간 녹화,
@@ -526,6 +635,14 @@ cd e2e && node run.mjs --duration=10 --long=60 --only=video-mp4,split-avi-wav
   동기 예외 → 영상 인코딩 실패 오류), `stop-race-stress`(offscreen 페이지에서 실제 `VideoTrackEncoder`를 40회 시작→중지),
   `record-cycles-mp4`(같은 offscreen 문서에서 팝업으로 0.6~1.6초 녹화 20회), `leak-selftest`(`--only`로만: 일부러 닫지 않은 프레임이 경고·집계에
   잡히는지 확인).
+- 오디오 소스 시나리오: `audio-mic-wav`(마이크, 오디오만 WAV, 설정 페이지에서 고른 장치), `audio-mix-mp3`(탭+마이크, 오디오만 MP3), `split-mix-mp4-wav`
+  (탭+마이크, 분리 저장), `video-mic-mp4`(마이크, 영상 파일 1개), `audio-mic-fallback-wav`(저장된 장치 없음 → 기본 마이크 + 경고). 마이크는 가짜로 바꾸지
+  않고 Chrome 가짜 장치(`--use-fake-device-for-media-stream`, `--use-file-for-fake-audio-capture`로 2.5 kHz 진폭 변조 시험 신호 재생)를 offscreen 페이지의
+  실제 `getUserMedia`로 엽니다. 권한은 설정 페이지에서 먼저 허용하고(`--use-fake-ui-for-media-stream`, 또는 `--noFakeUi`면 권한 창 자동 수락 없이 CDP로
+  미리 허용), 팝업에서 마이크 항목이 활성인지 확인한 뒤 고릅니다. 탭 캡처 요청(마이크만이면 탭 오디오 없음, 오디오만 + 마이크면 요청 자체가 없음), 마이크
+  제약(처리 옵션, exact 장치, 대체 재시도), 요청 시점 권한 granted, 중지 후 마이크 트랙 `ended`, 경고(대체: 시작 안내·완료 경고, 그 외 없음)를 검사하고,
+  결과 파일마다 대역별 음량으로 소스에 있는 소리(최대 > -30 dB, 평균 > -40 dB)와 없는 소리(평균이 20 dB 이상 작음)를 확인합니다 → 실측은
+  [오디오 소스](#오디오-소스-탭--마이크--탭마이크).
 
 ## 리소스 사용량 (헤드리스 Chrome 148, 소프트웨어 H.264, 12코어 샌드박스)
 
@@ -619,6 +736,15 @@ E2E 하네스의 합산 수치(`e2e/output/report.json`)에는 테스트용 가�
   작은 기여는 배제하지 못함). 10-18 장시간 실행에는 이전 세션의 캐시 해제 데몬(evictd-v2)이 계속 돌고 있었습니다. 실제 탭 캡처·오디오 장치가
   있는 PC에서 확인이 필요합니다.
 - WAV 파일은 RIFF 한계로 4 GB(48 kHz 스테레오 약 6시간)를 넘을 수 없으며, 2 GB를 넘으면 일부 플레이어가 열지 못합니다.
+- 마이크(오디오 소스)는 헤드리스 Chrome의 가짜 장치로만 검증했습니다. 실제 마이크와 권한 창(설정 페이지의 "마이크 권한 요청"에서 사람이 허용/차단),
+  장치 분리·재연결, 블루투스 헤드셋 전환, 실제 스피커 소리가 마이크로 다시 들어가는 에코와 Chrome 에코 제거의 효과는 실제 PC에서 확인이 필요합니다.
+- 탭+마이크는 녹화 중에도 탭 소리를 스피커로 내보내므로 스피커를 쓰면 탭 소리가 마이크로 다시 들어가 녹음에 겹칠 수 있습니다(에코 제거를 켜 두지만
+  완전하지 않음). 헤드폰 사용을 권장합니다.
+- 탭+마이크는 두 소리를 게인 1로 그대로 더하므로 둘 다 클 때 최대 크기를 넘는 부분이 잘릴(클리핑) 수 있습니다(E2E 시험 신호에서 전체 최대 0 dB).
+  소스별 GainNode(`MIC_SETTINGS.SOURCE_GAIN`)로 비율을 조정할 수 있게 구성했지만 지금은 사용자 설정이 없습니다. 마이크의 자동 음량 조절(AGC)도 켜져 있습니다.
+- 영상 + 마이크 녹화 중 마이크가 분리되면 영상은 계속 녹화되지만 그 뒤의 오디오는 기록되지 않아 오디오 트랙이 영상보다 짧아질 수 있습니다(완료 경고로 알림).
+- 마이크 장치 ID는 `chrome.storage.sync`로 다른 PC에도 동기화되지만 장치 ID는 PC(와 출처)마다 다르므로, 다른 PC에서는 "(연결 안 됨)"으로 보이고 시스템
+  기본 마이크로 녹음됩니다(경고 표시). 그 PC의 설정 페이지에서 다시 고르면 됩니다.
 - AVI는 RIFF 32비트 한계 때문에 2GB를 넘을 수 없습니다. 초과가 예상되면 자동으로 MP4로 저장하고 안내합니다.
 - 영상 파일의 오디오는 항상 MP3입니다(AAC 미지원). 오디오 포맷 선택은 별도 저장되는 오디오 파일에만 적용됩니다.
 - Chrome `<video>`는 AVI를 재생하지 않습니다(VLC, mpv, Windows 미디어 플레이어 등에서 재생).

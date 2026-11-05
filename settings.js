@@ -1,7 +1,10 @@
-// Settings Page - 녹화 파일 저장 위치(폴더) 설정 (options_page)
+// Settings Page - 녹화 파일 저장 위치(폴더)와 마이크 설정 (options_page)
 // File System Access API(showDirectoryPicker)로 고른 폴더 핸들을 IndexedDB에 보관하고(save-location.js),
 // 팝업이 폴더 모드인지 알 수 있도록 모드·이름 문자열은 chrome.storage.sync에 미러링합니다 (저장 위치는 이 페이지에서만 표시).
 // 폴더 선택 창은 팝업에서 열면 팝업이 포커스를 잃고 닫히므로 이 페이지(탭)에서만 엽니다.
+// 마이크: 녹화 문서(offscreen)는 권한 창을 띄울 수 없으므로 권한 요청과 장치 선택(micDeviceId)은 이 페이지에서 합니다 (audio-source.js).
+import { loadSettings, saveSettings } from './storage.js';
+import { MicSettingsSection } from './audio-source.js';
 import {
   loadDirectoryHandle,
   saveDirectoryHandle,
@@ -19,6 +22,19 @@ const requestPermissionButton = document.getElementById('requestPermissionButton
 const pickFolderButton = document.getElementById('pickFolderButton');
 const resetFolderButton = document.getElementById('resetFolderButton');
 const settingsMessage = document.getElementById('settingsMessage');
+
+// 마이크 섹션: 권한 상태·요청, 장치 목록(enumerateDevices, 권한을 얻은 뒤에만), 장치 연결 변경(devicechange) 반영
+const micSection = new MicSettingsSection({
+  elements: {
+    status: document.getElementById('micPermissionStatus'),
+    requestButton: document.getElementById('requestMicButton'),
+    deviceRow: document.getElementById('micDeviceRow'),
+    deviceSelect: document.getElementById('micDeviceSelect'),
+    message: document.getElementById('micMessage')
+  },
+  loadSettings,
+  saveSettings
+});
 
 const PERMISSION_TEXT = {
   granted: '권한: 허용됨 - 녹화 파일을 이 폴더에 바로 저장합니다.',
@@ -155,11 +171,16 @@ pickFolderButton.addEventListener('click', guarded(pickFolder));
 resetFolderButton.addEventListener('click', guarded(resetFolder));
 requestPermissionButton.addEventListener('click', guarded(requestPermissionAgain));
 
-// 다른 탭에서 사이트 권한을 바꾼 뒤 돌아오면 상태 다시 확인
+// 다른 탭에서 사이트 권한을 바꾼 뒤 돌아오면 상태 다시 확인 (폴더 권한, 마이크 권한)
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && !busy) refresh();
+  if (document.hidden) return;
+  if (!busy) refresh();
+  micSection.refresh().catch((error) => console.warn('[Settings] 마이크 상태 갱신 실패:', error));
 });
 
-refresh().finally(() => {
+Promise.allSettled([
+  refresh(),
+  micSection.init().catch((error) => console.error('[Settings] 마이크 설정 초기화 실패:', error))
+]).finally(() => {
   document.body.dataset.ready = 'true';
 });

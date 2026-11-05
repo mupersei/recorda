@@ -1,7 +1,7 @@
 import { MESSAGE_TYPES, SETTINGS, ERROR_MESSAGES, RECORDING_STATES, RECORDING_MODES, SESSION_KEYS, SAVE_LOCATIONS } from './constants.js';
 import { getActiveElapsedSeconds } from './utils.js';
 import { loadSettings, resetSettings } from './storage.js';
-import { resolveRecordingPlan } from './recording-plan.js';
+import { resolveRecordingPlan, planCapturesTab } from './recording-plan.js';
 
 // ---------------------------------------------------------------------------
 // 상태 관리
@@ -152,7 +152,7 @@ async function handleStartRecording(data, sendResponse) {
 
   let started = false;
   try {
-    const { tabId, format, mode, videoFormat, saveLocation } = data || {};
+    const { tabId, format, mode, videoFormat, saveLocation, audioSource, micDeviceId } = data || {};
     // 저장 위치: 팝업이 녹화 시작 클릭(사용자 제스처) 때 폴더 권한을 확인한 경우에만 'folder'. 그 외는 기존 다운로드 경로
     const saveToFolder = saveLocation === SAVE_LOCATIONS.FOLDER;
 
@@ -163,27 +163,36 @@ async function handleStartRecording(data, sendResponse) {
     const settings = await loadSettings();
     console.log('[Background] 사용자 설정 로드:', settings);
 
-    // 녹화 계획 결정 (요청 값 > 저장된 설정 > 기본값). 잘못된 모드/포맷은 여기서 에러.
+    // 녹화 계획 결정 (요청 값 > 저장된 설정 > 기본값). 잘못된 모드/포맷/오디오 소스는 여기서 에러.
+    // 오디오 소스: 팝업은 마이크 권한이 없으면 'tab'을 보냄. 장치 ID는 요청의 빈 값('' = 시스템 기본 마이크)도 그대로 존중
     const plan = resolveRecordingPlan({
       mode: mode || settings.recordingMode,
       audioFormat: format || settings.fileFormat || SETTINGS.DEFAULT_FORMAT,
-      videoFormat: videoFormat || settings.videoFormat
+      videoFormat: videoFormat || settings.videoFormat,
+      audioSource: audioSource || settings.audioSource,
+      micDeviceId: typeof micDeviceId === 'string' ? micDeviceId : settings.micDeviceId
     });
     console.log('[Background] 녹화 계획:', plan, '| 저장 위치:', saveToFolder ? '사용자 폴더' : '다운로드 폴더');
 
     // Offscreen Document를 먼저 준비 (스트림 ID는 발급 후 짧은 시간 안에 사용해야 함)
     await createOffscreenDocument();
 
-    console.log('[Background] MediaStream ID 요청, targetTabId:', tabId);
-    let streamId;
-    try {
-      streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
-    } catch (error) {
-      throw new Error(translateStreamIdError(error));
-    }
+    // 탭 캡처 스트림 ID: 영상 또는 탭 오디오를 캡처할 때만. 오디오만 + 마이크는 탭에서 캡처할 것이 없으므로 발급하지 않음
+    // (탭에 캡처 표시가 뜨지 않고, chrome:// 처럼 캡처할 수 없는 탭에서도 마이크 녹음 가능)
+    let streamId = null;
+    if (planCapturesTab(plan)) {
+      console.log('[Background] MediaStream ID 요청, targetTabId:', tabId);
+      try {
+        streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+      } catch (error) {
+        throw new Error(translateStreamIdError(error));
+      }
 
-    if (!streamId || typeof streamId !== 'string' || streamId.trim().length === 0) {
-      throw new Error(ERROR_MESSAGES.CAPTURE_FAILED);
+      if (!streamId || typeof streamId !== 'string' || streamId.trim().length === 0) {
+        throw new Error(ERROR_MESSAGES.CAPTURE_FAILED);
+      }
+    } else {
+      console.log('[Background] 탭 캡처 없음 (오디오만 + 마이크): MediaStream ID를 발급하지 않음');
     }
 
     const audioOutput = plan.outputs.find(o => o.kind === 'audio');
@@ -221,7 +230,9 @@ async function handleStartRecording(data, sendResponse) {
 
     chrome.alarms.create(ALARM_UPDATE_TIME, { periodInMinutes: 1 / 60 });
     // 상태 페이로드 포함: Popup이 자체 타이머를 Background의 startTime 기준으로 시작하도록 (일시정지 시 표시 시간 튐 방지)
-    sendResponse({ success: true, data: buildStatePayload() });
+    // warnings: Offscreen의 시작 경고 (고른 마이크가 없어 시스템 기본 마이크로 녹음 등) → 팝업이 안내로 표시
+    const warnings = Array.isArray(response.warnings) ? response.warnings.filter(w => typeof w === 'string' && w) : [];
+    sendResponse({ success: true, data: buildStatePayload(), warnings });
   } catch (error) {
     console.error('녹음 시작 실패:', error);
     if (started) {
@@ -721,11 +732,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }).catch((error) => console.error('[Background] 알람 처리 실패:', error));
 });
 
-// 녹화 중인 탭이 닫히면 녹화를 마무리 (일시정지 중이어도)
+// 녹화 중인 탭이 닫히면 녹화를 마무리 (일시정지 중이어도). 탭을 캡처하지 않는 녹화(오디오만 + 마이크)는 탭과 무관하므로 계속
 if (chrome.tabs && chrome.tabs.onRemoved) {
   chrome.tabs.onRemoved.addListener((tabId) => {
     ready.then(async () => {
-      if (isSessionActive() && recordingState.tabId === tabId) {
+      if (isSessionActive() && recordingState.tabId === tabId && planCapturesTab(recordingState.plan)) {
         console.warn('[Background] 녹화 중인 탭이 닫혔습니다. 녹화를 마무리합니다:', tabId);
         await beginProcessing();
       }

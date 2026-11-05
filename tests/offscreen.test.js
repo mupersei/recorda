@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { installFakeChrome } from './helpers/fake-chrome.js';
-import { FakeVideoFrame, FakeReader, makeFakeTrackProcessor, makeFakeVideoEncoder } from './helpers/fakes.js';
+import { FakeVideoFrame, FakeReader, makeFakeTrackProcessor, makeFakeVideoEncoder, makeFakeMicStream, namedError } from './helpers/fakes.js';
 import { MESSAGE_TYPES, RECORDING_MODES, ERROR_MESSAGES } from '../constants.js';
 import { resolveRecordingPlan } from '../recording-plan.js';
 
@@ -41,19 +41,34 @@ class FakePort {
     }
   }
 }
-class FakeAudioWorkletNode {
-  constructor() { this.port = new FakePort(); workletPorts.push(this.port); }
-  connect() {} disconnect() {}
+// Web Audio 노드 연결 기록 (오디오 소스 그래프 검사: 소스 → GainNode → 워크릿, 탭만 destination)
+let lastAudioContext = null;
+class FakeAudioNode {
+  constructor(context, kind, extra = {}) { this.context = context; this.kind = kind; this.disconnected = false; Object.assign(this, extra); if (context) context.nodes.push(this); }
+  connect(target) { this.context.connections.push([this, target]); return target; }
+  disconnect() { this.disconnected = true; }
+}
+class FakeAudioWorkletNode extends FakeAudioNode {
+  constructor(context, name, options) { super(context, 'worklet', { processorName: name, options }); this.port = new FakePort(); workletPorts.push(this.port); }
 }
 class FakeAudioContext {
-  constructor(opts = {}) { (globalThis.__audioContextOpts = globalThis.__audioContextOpts || []).push(opts); this.sampleRate = opts.sampleRate || 44100; this.state = 'running'; this.destination = {}; this.audioWorklet = { addModule: async () => {} }; }
-  createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+  constructor(opts = {}) {
+    (globalThis.__audioContextOpts = globalThis.__audioContextOpts || []).push(opts);
+    this.sampleRate = opts.sampleRate || 44100; this.state = 'running'; this.audioWorklet = { addModule: async () => {} };
+    this.nodes = []; this.connections = [];
+    this.destination = new FakeAudioNode(this, 'destination');
+    lastAudioContext = this;
+  }
+  createMediaStreamSource(stream) { return new FakeAudioNode(this, 'source', { stream }); }
+  createGain() { return new FakeAudioNode(this, 'gain', { gain: { value: 1 } }); }
   async resume() { this.state = 'running'; }
   async close() { this.state = 'closed'; }
 }
-function makeStream({ withVideo }) {
-  const tracks = [{ kind: 'audio', label: 'tab', enabled: true, readyState: 'live', onended: null, stop() {} }];
-  if (withVideo) tracks.push({ kind: 'video', label: 'tab', enabled: true, readyState: 'live', onended: null, stop() {}, getSettings: () => ({ width: 160, height: 120 }) });
+function makeStream({ withVideo, withAudio = true }) {
+  const track = (kind, extra = {}) => ({ kind, label: 'tab', enabled: true, readyState: 'live', onended: null, stopped: false, stop() { this.stopped = true; this.readyState = 'ended'; }, ...extra });
+  const tracks = [];
+  if (withAudio) tracks.push(track('audio'));
+  if (withVideo) tracks.push(track('video', { getSettings: () => ({ width: 160, height: 120 }) }));
   const stream = {
     getTracks: () => tracks,
     getAudioTracks: () => tracks.filter(t => t.kind === 'audio'),
@@ -62,6 +77,11 @@ function makeStream({ withVideo }) {
   globalThis.__lastStream = stream;
   return stream;
 }
+// 탭 캡처 요청(chromeMediaSource: 'tab')인지 - 아니면 마이크 요청
+const isTabRequest = (c) => !!c && [c.audio, c.video].some(x => x && x.mandatory && x.mandatory.chromeMediaSource === 'tab');
+let gumCalls = [];          // 모든 getUserMedia 요청 (탭 + 마이크)
+let micStreams = [];        // 돌려준 마이크 스트림
+let micBehavior = null;     // (constraints) => 스트림 | throw. null이면 기본 마이크 스트림
 
 before(async () => {
   globalThis.AudioContext = FakeAudioContext;
@@ -71,8 +91,15 @@ before(async () => {
     value: {
       mediaDevices: {
         getUserMedia: async (constraints) => {
+          gumCalls.push(constraints);
+          if (!isTabRequest(constraints)) {
+            // 마이크 (offscreen은 탭 캡처 다음에 요청)
+            const stream = micBehavior ? await micBehavior(constraints) : makeFakeMicStream({ label: 'mic', deviceId: (constraints.audio && constraints.audio.deviceId && constraints.audio.deviceId.exact) || 'default' });
+            micStreams.push(stream);
+            return stream;
+          }
           lastConstraints = constraints;
-          return makeStream({ withVideo: !!constraints.video });
+          return makeStream({ withVideo: !!constraints.video, withAudio: !!constraints.audio });
         }
       }
     }
@@ -1065,4 +1092,313 @@ test('정상 중지에서도 영상 리더를 끝낸 뒤 캡처 트랙을 멈추
     order.restore();
     dispose.restore();
   }
+});
+
+// ---- 오디오 소스: 탭 / 마이크 / 탭+마이크 ----
+import { resolveObjectURL } from 'node:buffer';
+import { MIC_SETTINGS } from '../constants.js';
+
+/** 그래프 조회: 소스 노드(탭/마이크), 노드 사이 경로 (through가 false인 노드는 지나가지 않음) */
+function graphOf(ctx = lastAudioContext) {
+  const edges = ctx.connections;
+  const outOf = (node) => edges.filter(([from]) => from === node).map(([, to]) => to);
+  const reaches = (from, to, through = () => true) => {
+    const seen = new Set([from]);
+    const queue = [from];
+    while (queue.length) {
+      const node = queue.shift();
+      for (const next of outOf(node)) {
+        if (next === to) return true;
+        if (seen.has(next) || !through(next)) continue;
+        seen.add(next);
+        queue.push(next);
+      }
+    }
+    return false;
+  };
+  const sources = ctx.nodes.filter(n => n.kind === 'source');
+  return {
+    ctx,
+    edges,
+    outOf,
+    reaches,
+    tabSource: sources.find(n => n.stream === globalThis.__lastStream && n.stream.getAudioTracks().length > 0) || null,
+    micSource: sources.find(n => micStreams.includes(n.stream)) || null,
+    sources,
+    gains: ctx.nodes.filter(n => n.kind === 'gain'),
+    worklet: ctx.nodes.find(n => n.kind === 'worklet') || null
+  };
+}
+const micCalls = () => gumCalls.filter(c => !isTabRequest(c));
+const tabCalls = () => gumCalls.filter(c => isTabRequest(c));
+const EXPECTED_MIC_AUDIO = (deviceId) => ({ ...(deviceId ? { deviceId: { exact: deviceId } } : {}), echoCancellation: true, noiseSuppression: true, autoGainControl: true });
+
+function resetMicFakes() {
+  gumCalls = [];
+  micStreams = [];
+  micBehavior = null;
+  workletPorts = [];
+  fake.calls.sendMessage.length = 0;
+}
+
+async function startWithSource({ mode, audioSource, micDeviceId = null, audioFormat = 'wav', videoFormat = 'mp4', streamId = 'sid-mic', sampleRate = 44100, timeoutMs = 300 }) {
+  const plan = resolveRecordingPlan({ mode, audioFormat, videoFormat, audioSource, micDeviceId });
+  return fake.dispatch({ action: MESSAGE_TYPES.START_CAPTURE, data: { streamId, format: audioFormat, bitrate: 128, sampleRate, plan, startTime: LOCAL_START } }, { timeoutMs });
+}
+
+test('탭+마이크(오디오만 WAV): 탭 오디오만 캡처(영상 없음)한 뒤 마이크를 exact 장치 + 에코 제거·잡음 억제·자동 음량으로 열고, 소스마다 GainNode(1)를 거쳐 하나의 워크릿에 섞으며 탭 소리만 destination(스피커)에 연결한다', async () => {
+  resetMicFakes();
+  const res = await startWithSource({ mode: RECORDING_MODES.AUDIO_ONLY, audioSource: 'tab+mic', micDeviceId: 'usb-1' });
+  assert.equal(res.success, true, res.error);
+  assert.deepEqual(res.warnings, [], '시작 경고 없음');
+
+  assert.equal(tabCalls().length, 1, '탭 캡처 1회');
+  assert.equal(tabCalls()[0].audio.mandatory.chromeMediaSourceId, 'sid-mic');
+  assert.equal(tabCalls()[0].video, false);
+  assert.deepEqual(micCalls(), [{ audio: EXPECTED_MIC_AUDIO('usb-1') }], '마이크 제약');
+  assert.ok(gumCalls.indexOf(tabCalls()[0]) < gumCalls.indexOf(micCalls()[0]), '탭 스트림 ID를 먼저 사용 (발급 직후 만료 방지)');
+  assert.deepEqual(MIC_SETTINGS.PROCESSING, { echoCancellation: true, noiseSuppression: true, autoGainControl: true });
+
+  const g = graphOf();
+  assert.ok(g.tabSource && g.micSource, '탭·마이크 소스 노드');
+  assert.ok(g.worklet, '워크릿 1개');
+  assert.equal(workletPorts.length, 1, '두 소스가 같은 워크릿을 공유 (일시정지·재개도 한 곳에서)');
+  assert.ok(g.edges.some(([a, b]) => a === g.tabSource && b === g.ctx.destination), '탭 소스 → destination (녹화 중에도 탭 소리가 들림)');
+  for (const source of [g.tabSource, g.micSource]) {
+    const [gain, ...rest] = g.outOf(source).filter(n => n.kind === 'gain');
+    assert.ok(gain && rest.length === 0, '소스마다 GainNode 하나');
+    assert.equal(gain.gain.value, 1);
+    assert.deepEqual(g.outOf(gain), [g.worklet], 'GainNode → 워크릿');
+  }
+  assert.notEqual(g.outOf(g.tabSource).find(n => n.kind === 'gain'), g.outOf(g.micSource).find(n => n.kind === 'gain'), '소스별 GainNode');
+  assert.equal(g.reaches(g.micSource, g.ctx.destination, n => n.kind !== 'worklet'), false, '마이크는 (무음 출력인 워크릿 말고는) destination에 닿지 않음 - 에코 방지');
+  assert.ok(!g.outOf(g.micSource).includes(g.ctx.destination));
+
+  const started = sentOf(MESSAGE_TYPES.RECORDING_STARTED).at(-1);
+  assert.deepEqual(started.data, { warnings: [] });
+  feedAudio(3);
+  fake.calls.sendMessage.length = 0;
+  await stopCapture(200);
+  const complete = sentOf(MESSAGE_TYPES.RECORDING_COMPLETE)[0];
+  assert.ok(complete, 'RECORDING_COMPLETE');
+  assert.deepEqual(complete.data.files.map(f => f.format), ['wav']);
+  assert.equal(complete.data.warning, undefined);
+  assert.ok(micStreams[0].getTracks().every(t => t.stopped), '중지 후 마이크 트랙 중지');
+  assert.ok(globalThis.__lastStream.getTracks().every(t => t.stopped), '탭 트랙 중지');
+});
+
+test('탭 소스(기본)도 소스 → GainNode(1) → 워크릿, 소스 → destination으로 연결하고 마이크는 열지 않는다 (기존 동작)', async () => {
+  installVideoFakes(4);
+  resetMicFakes();
+  const res = await startWithSource({ mode: RECORDING_MODES.VIDEO_AUDIO_SPLIT, audioSource: 'tab' });
+  assert.equal(res.success, true, res.error);
+  assert.deepEqual(micCalls(), [], '마이크 요청 없음');
+  const g = graphOf();
+  assert.ok(g.tabSource);
+  assert.equal(g.micSource, null);
+  assert.ok(g.edges.some(([a, b]) => a === g.tabSource && b === g.ctx.destination));
+  const gain = g.outOf(g.tabSource).find(n => n.kind === 'gain');
+  assert.ok(gain && g.outOf(gain).includes(g.worklet));
+  feedAudio(2);
+  await stopCapture(200);
+});
+
+test('마이크(영상+오디오 MP4): 탭에는 영상만 요청하고(탭 오디오 제약 없음 → 탭 소리는 캡처되지 않아 평소처럼 재생), 영상 파일의 오디오는 마이크다. destination에는 아무 소스도 연결하지 않는다', async () => {
+  installVideoFakes(6);
+  resetMicFakes();
+  const res = await startWithSource({ mode: RECORDING_MODES.VIDEO_AUDIO, audioSource: 'mic', micDeviceId: null, videoFormat: 'mp4' });
+  assert.equal(res.success, true, res.error);
+  assert.equal(tabCalls().length, 1);
+  assert.equal(tabCalls()[0].audio, false, '탭 오디오 요청 없음');
+  assert.equal(tabCalls()[0].video.mandatory.chromeMediaSource, 'tab', '영상은 녹화를 시작한 탭에서');
+  assert.deepEqual(micCalls(), [{ audio: EXPECTED_MIC_AUDIO(null) }], '장치 지정이 없으면 deviceId 제약 없이(시스템 기본 마이크)');
+
+  const g = graphOf();
+  assert.equal(g.tabSource, null, '탭 오디오 소스 없음');
+  assert.ok(g.micSource);
+  assert.equal(g.sources.length, 1);
+  assert.ok(!g.edges.some(([a, b]) => a.kind === 'source' && b === g.ctx.destination), '스피커로 내보내는 소스 없음');
+  assert.ok(g.reaches(g.micSource, g.worklet));
+
+  feedAudio(4);
+  fake.calls.sendMessage.length = 0;
+  await stopCapture(300);
+  const complete = sentOf(MESSAGE_TYPES.RECORDING_COMPLETE)[0];
+  assert.ok(complete, 'RECORDING_COMPLETE');
+  assert.deepEqual(complete.data.files.map(f => f.format), ['mp4']);
+  assert.ok(micStreams[0].getTracks().every(t => t.stopped));
+});
+
+test('마이크(오디오만): 탭에서 캡처할 것이 없으므로 탭 getUserMedia를 부르지 않고(스트림 ID 없음) 마이크만 녹음한다. WAV 헤더의 샘플레이트는 마이크(48 kHz)가 아니라 AudioContext·인코더 설정 값', async () => {
+  resetMicFakes();
+  globalThis.__audioContextOpts = [];
+  const res = await startWithSource({ mode: RECORDING_MODES.AUDIO_ONLY, audioSource: 'mic', micDeviceId: 'usb-1', streamId: null, sampleRate: 44100 });
+  assert.equal(res.success, true, res.error);
+  assert.deepEqual(tabCalls(), [], '탭 캡처 없음');
+  assert.deepEqual(micCalls(), [{ audio: EXPECTED_MIC_AUDIO('usb-1') }]);
+  assert.equal(micStreams[0].getAudioTracks()[0].getSettings().sampleRate, 48000, '가짜 마이크는 48 kHz');
+  assert.ok(globalThis.__audioContextOpts.every(o => o.sampleRate === 44100), 'AudioContext는 설정 샘플레이트 (마이크 입력은 AudioContext가 리샘플링)');
+  assert.ok(!('sampleRate' in micCalls()[0].audio), '마이크에 샘플레이트 제약을 걸지 않음');
+
+  feedAudio(3);
+  fake.calls.sendMessage.length = 0;
+  await stopCapture(200);
+  const download = sentOf(MESSAGE_TYPES.DOWNLOAD_FILE)[0];
+  assert.ok(download, 'DOWNLOAD_FILE');
+  const wav = new Uint8Array(await resolveObjectURL(download.data.url).arrayBuffer());
+  const view = new DataView(wav.buffer);
+  assert.equal(String.fromCharCode(...wav.subarray(0, 4)), 'RIFF');
+  assert.equal(view.getUint32(24, true), 44100, 'WAV 샘플레이트 = AudioContext.sampleRate');
+  assert.equal(view.getUint16(22, true), 2, '스테레오 (모노 마이크는 워크릿 입력에서 양쪽 채널로)');
+  assert.ok(micStreams[0].getTracks().every(t => t.stopped));
+});
+
+for (const [errorName, extra] of [['OverconstrainedError', { constraint: 'deviceId' }], ['NotFoundError', {}]]) {
+  test(`고른 마이크가 없으면(exact → ${errorName}) 시스템 기본 마이크로 다시 열고 START_CAPTURE 응답·RECORDING_STARTED(현재형 안내)·RECORDING_COMPLETE(과거형 경고)에 경고를 넣는다`, async () => {
+    resetMicFakes();
+    micBehavior = async (constraints) => {
+      if (constraints.audio.deviceId) throw namedError(errorName, 'Requested device not found', extra);
+      return makeFakeMicStream({ label: 'default mic', deviceId: 'default' });
+    };
+    const res = await startWithSource({ mode: RECORDING_MODES.AUDIO_ONLY, audioSource: 'tab+mic', micDeviceId: 'unplugged-usb', audioFormat: 'mp3' });
+    assert.equal(res.success, true, res.error);
+    assert.deepEqual(micCalls(), [{ audio: EXPECTED_MIC_AUDIO('unplugged-usb') }, { audio: EXPECTED_MIC_AUDIO(null) }], 'exact 실패 → deviceId 없이 재시도');
+    assert.deepEqual(res.warnings, [ERROR_MESSAGES.MIC_FALLBACK_DEFAULT_START]);
+    assert.match(ERROR_MESSAGES.MIC_FALLBACK_DEFAULT_START, /녹음합니다\.$/, '시작 안내는 현재형');
+    assert.deepEqual(sentOf(MESSAGE_TYPES.RECORDING_STARTED).at(-1).data, { warnings: [ERROR_MESSAGES.MIC_FALLBACK_DEFAULT_START] });
+    assert.ok(graphOf().micSource, '기본 마이크로 녹음');
+    feedAudio(3);
+    fake.calls.sendMessage.length = 0;
+    await stopCapture(200);
+    const complete = sentOf(MESSAGE_TYPES.RECORDING_COMPLETE)[0];
+    assert.ok(complete);
+    assert.equal(complete.data.warning, ERROR_MESSAGES.MIC_FALLBACK_DEFAULT);
+    assert.deepEqual(complete.data.warnings, [ERROR_MESSAGES.MIC_FALLBACK_DEFAULT]);
+    assert.ok(micStreams.every(s => s.getTracks().every(t => t.stopped)));
+  });
+}
+
+test('마이크 권한이 없으면(NotAllowedError) MIC_PERMISSION_DENIED로 시작에 실패하고, 이미 연 탭 캡처 트랙을 멈추며 RECORDING_STARTED를 보내지 않는다', async () => {
+  installVideoFakes(4);
+  resetMicFakes();
+  micBehavior = async () => { throw namedError('NotAllowedError', 'Permission dismissed'); };
+  const res = await startWithSource({ mode: RECORDING_MODES.VIDEO_AUDIO_SPLIT, audioSource: 'tab+mic', micDeviceId: 'usb-1', timeoutMs: 2000 });
+  assert.ok(res, '시작 응답');
+  assert.equal(res.success, false);
+  assert.equal(res.error, ERROR_MESSAGES.MIC_PERMISSION_DENIED);
+  assert.equal(micCalls().length, 1, '권한 오류는 다른 장치로 재시도하지 않음');
+  assert.equal(sentOf(MESSAGE_TYPES.RECORDING_ERROR).at(-1).data.error, ERROR_MESSAGES.MIC_PERMISSION_DENIED);
+  assert.equal(sentOf(MESSAGE_TYPES.RECORDING_STARTED).length, 0);
+  const tabTracks = globalThis.__lastStream.getTracks();
+  assert.ok(tabTracks.length === 2 && tabTracks.every(t => t.stopped), '탭 오디오·영상 트랙 정리');
+  assert.equal(sentOf(MESSAGE_TYPES.DOWNLOAD_FILE).length, 0);
+  // 다음 녹화를 바로 시작할 수 있음 (캡처 상태가 남지 않음)
+  resetMicFakes();
+  const again = await startWithSource({ mode: RECORDING_MODES.AUDIO_ONLY, audioSource: 'tab' });
+  assert.equal(again.success, true, again.error);
+  feedAudio(1);
+  await stopCapture(200);
+});
+
+test('기본 마이크도 없으면(재시도도 NotFoundError) MIC_DEVICE_NOT_FOUND, 장치를 열 수 없으면(NotReadableError) MIC_UNAVAILABLE로 시작에 실패하고 탭 트랙을 정리한다', async () => {
+  for (const [behavior, expected] of [
+    [async () => { throw namedError('NotFoundError', 'Requested device not found'); }, ERROR_MESSAGES.MIC_DEVICE_NOT_FOUND],
+    [async () => { throw namedError('NotReadableError', 'Could not start audio source'); }, ERROR_MESSAGES.MIC_UNAVAILABLE]
+  ]) {
+    resetMicFakes();
+    micBehavior = behavior;
+    const res = await startWithSource({ mode: RECORDING_MODES.AUDIO_ONLY, audioSource: 'tab+mic', micDeviceId: 'usb-1', timeoutMs: 2000 });
+    assert.equal(res.success, false);
+    assert.ok(res.error.startsWith(expected), `${res.error}`);
+    assert.ok(globalThis.__lastStream.getTracks().every(t => t.stopped), '탭 트랙 정리');
+  }
+});
+
+test('녹화 중 탭 캡처가 끝나면(탭 닫힘) 스스로 마무리하고 마이크 트랙도 멈춘다 (탭+마이크, 영상+오디오)', async () => {
+  installVideoFakes(4);
+  resetMicFakes();
+  const res = await startWithSource({ mode: RECORDING_MODES.VIDEO_AUDIO, audioSource: 'tab+mic', micDeviceId: 'usb-1' });
+  assert.equal(res.success, true, res.error);
+  feedAudio(3);
+  fake.calls.sendMessage.length = 0;
+  const videoTrack = globalThis.__lastStream.getVideoTracks()[0];
+  videoTrack.onended();
+  const deadline = Date.now() + 3000;
+  while (!sentOf(MESSAGE_TYPES.RECORDING_COMPLETE).length && Date.now() < deadline) await flush(10);
+  assert.ok(sentOf(MESSAGE_TYPES.RECORDING_COMPLETE).length === 1, 'RECORDING_COMPLETE');
+  assert.ok(micStreams[0].getTracks().every(t => t.stopped), '마이크 트랙 중지');
+});
+
+test('마이크만 녹음(오디오만) 중 마이크 연결이 끊기면(트랙 ended) 그때까지의 파일을 저장하고 경고를 붙인다', async () => {
+  resetMicFakes();
+  const res = await startWithSource({ mode: RECORDING_MODES.AUDIO_ONLY, audioSource: 'mic', streamId: null });
+  assert.equal(res.success, true, res.error);
+  feedAudio(2);
+  fake.calls.sendMessage.length = 0;
+  micStreams[0].getAudioTracks()[0].end();
+  const deadline = Date.now() + 3000;
+  while (!sentOf(MESSAGE_TYPES.RECORDING_COMPLETE).length && Date.now() < deadline) await flush(10);
+  const complete = sentOf(MESSAGE_TYPES.RECORDING_COMPLETE)[0];
+  assert.ok(complete, '스스로 마무리');
+  assert.equal(complete.data.warning, ERROR_MESSAGES.MIC_DISCONNECTED_STOPPED);
+  assert.ok(complete.data.files[0].size > 44);
+});
+
+test('탭+마이크 중 마이크 연결이 끊기면 탭 소리 녹음은 계속하고, 완료 경고에 마이크 끊김을 알린다', async () => {
+  resetMicFakes();
+  const res = await startWithSource({ mode: RECORDING_MODES.AUDIO_ONLY, audioSource: 'tab+mic' });
+  assert.equal(res.success, true, res.error);
+  feedAudio(1);
+  micStreams[0].getAudioTracks()[0].end();
+  await flush(50);
+  assert.equal(sentOf(MESSAGE_TYPES.RECORDING_COMPLETE).length, 0, '계속 녹음');
+  assert.equal(globalThis.__lastStream.getAudioTracks()[0].stopped, false);
+  feedAudio(1);
+  fake.calls.sendMessage.length = 0;
+  await stopCapture(200);
+  const complete = sentOf(MESSAGE_TYPES.RECORDING_COMPLETE)[0];
+  assert.ok(complete);
+  assert.equal(complete.data.warning, ERROR_MESSAGES.MIC_DISCONNECTED);
+});
+
+test('일시정지/재개는 섞인 소리 전체에 같은 방식(공용 워크릿 pause/resume)으로 적용되고, 일시정지 중에도 마이크·탭 캡처는 유지한다', async () => {
+  resetMicFakes();
+  const spy = spyPcm();
+  try {
+    const res = await startWithSource({ mode: RECORDING_MODES.AUDIO_ONLY, audioSource: 'tab+mic' });
+    assert.equal(res.success, true, res.error);
+    const port = workletPorts[0];
+    feedAudioValue(1, 0.25);
+    await fake.dispatch({ action: MESSAGE_TYPES.PAUSE_CAPTURE, data: { pausedAt: 1, pausedTotalMs: 0 } });
+    await flush();
+    feedAudioValue(1, 0.75);
+    assert.equal(micStreams[0].getAudioTracks()[0].stopped, false, '일시정지 중에도 마이크 캡처 유지');
+    await fake.dispatch({ action: MESSAGE_TYPES.RESUME_CAPTURE, data: { pausedTotalMs: 100 } });
+    feedAudioValue(1, 0.125);
+    await stopCapture(200);
+    assert.deepEqual(port.posted.map(m => m.command), ['start', 'pause', 'resume', 'stop']);
+    assert.deepEqual(spy.values('wav'), [0.25, 0.5, 0.125, 0], '일시정지 구간 PCM 없음');
+  } finally {
+    spy.restore();
+  }
+});
+
+test('RECORDING_HEARTBEAT의 계획에 오디오 소스가 담긴다 (SW 재시작 복구)', async () => {
+  resetMicFakes();
+  const plan = resolveRecordingPlan({ mode: RECORDING_MODES.AUDIO_ONLY, audioFormat: 'mp3', audioSource: 'tab+mic', micDeviceId: 'usb-1' });
+  const res = await fake.dispatch({ action: MESSAGE_TYPES.START_CAPTURE, data: { streamId: 'hbm', format: 'mp3', bitrate: 128, sampleRate: 44100, plan, tabId: 5, startTime: 1, heartbeatIntervalMs: 40 } });
+  assert.equal(res.success, true, res.error);
+  await flush(100);
+  const beat = sentOf(MESSAGE_TYPES.RECORDING_HEARTBEAT).at(-1);
+  assert.equal(beat.data.plan.audioSource, 'tab+mic');
+  assert.equal(beat.data.plan.captureMic, true);
+  await stopCapture(200);
+});
+
+test('탭을 캡처해야 하는 계획인데 스트림 ID가 없으면 시작에 실패한다', async () => {
+  resetMicFakes();
+  const res = await startWithSource({ mode: RECORDING_MODES.VIDEO_AUDIO, audioSource: 'mic', streamId: null, timeoutMs: 2000 });
+  assert.equal(res.success, false);
+  assert.equal(res.error, ERROR_MESSAGES.CAPTURE_FAILED);
+  assert.deepEqual(gumCalls, [], '탭·마이크 모두 열지 않음');
 });

@@ -1,17 +1,25 @@
-import { MESSAGE_TYPES, ERROR_MESSAGES, SETTINGS, VIDEO_SETTINGS, VIDEO_FORMATS, SAVE_LOCATIONS } from './constants.js';
+import { MESSAGE_TYPES, ERROR_MESSAGES, SETTINGS, VIDEO_SETTINGS, VIDEO_FORMATS, SAVE_LOCATIONS, MIC_SETTINGS } from './constants.js';
 import { WavFileEncoder, Mp3FileEncoder } from './audio-file-encoders.js';
 import { generateRecordingFilenames, recordingBaseName, fileExtension, formatLabel } from './utils.js';
-import { resolveRecordingPlan } from './recording-plan.js';
+import { resolveRecordingPlan, planCapturesTab } from './recording-plan.js';
 import { VideoRecordingSession } from './video-recorder.js';
 import { createRecordingStorage, cleanupStaleRecordings, DirectoryFileSink, FailoverFileSink } from './storage/chunk-store.js';
 import { loadDirectoryHandle, queryFolderPermission, findAvailableBaseName, folderDisplayName } from './save-location.js';
 
 const AUDIO_MIME_TYPES = { mp3: 'audio/mpeg', wav: 'audio/wav' };
+// 캡처 경고의 시작 안내 문구 (완료 경고는 과거형, 녹화 시작 직후 팝업 안내는 현재형)
+const START_NOTICES = { [ERROR_MESSAGES.MIC_FALLBACK_DEFAULT]: ERROR_MESSAGES.MIC_FALLBACK_DEFAULT_START };
 
 // 전역 변수
 let audioContext = null;
-let audioSource = null;
-let stream = null;
+let audioSource = null;         // 탭 오디오 MediaStreamSource (destination 루프백 + 탭 GainNode)
+let stream = null;              // 탭 캡처 스트림 (탭 오디오 및/또는 영상). 오디오만 + 마이크면 null
+// 마이크 (오디오 소스 mic / tab+mic): 소스마다 MediaStreamSource → GainNode(1) → 공용 AudioWorklet에서 섞임
+let micStream = null;
+let micSource = null;
+let tabGain = null;
+let micGain = null;
+let captureWarnings = [];      // 캡처 관련 경고 (고른 마이크 없음 → 기본 마이크 등). RECORDING_STARTED / COMPLETE에 포함
 let recordingPlan = null;
 let recordingBitrate = SETTINGS.DEFAULT_BITRATE / 1000; // kbps
 let recordingSampleRate = 44100;
@@ -109,44 +117,63 @@ async function handleStartCapture(data, sendResponse) {
     cleanupStaleRecordings(storageManager, sessionId).then((n) => { if (n) console.log('[Offscreen] 이전 녹화 임시 파일 정리:', n, '개'); });
 
     saveWarnings = [];
+    captureWarnings = [];
     audioOutput = null;
     saveFolder = null;
 
     console.log('[Offscreen] 녹화 계획:', recordingPlan);
 
-    // Manifest V3 방식: streamId를 사용하여 MediaStream 획득
-    const constraints = {
-      audio: {
-        mandatory: {
-          chromeMediaSource: 'tab',
-          chromeMediaSourceId: streamId
-        }
-      },
-      video: recordingPlan.captureVideo
-        ? {
-          mandatory: {
-            chromeMediaSource: 'tab',
-            chromeMediaSourceId: streamId,
-            maxWidth: VIDEO_SETTINGS.MAX_WIDTH,
-            maxHeight: VIDEO_SETTINGS.MAX_HEIGHT,
-            maxFrameRate: VIDEO_SETTINGS.FRAME_RATE
+    // 오디오 소스: 탭 오디오(tab, tab+mic) / 마이크(mic, tab+mic). 이전 형식 계획(필드 없음)은 탭 오디오만
+    const captureTabAudio = recordingPlan.captureTabAudio !== false;
+    const captureMic = recordingPlan.captureMic === true;
+
+    // 탭 캡처: 영상 또는 탭 오디오가 필요할 때만 (오디오만 + 마이크는 탭에서 캡처할 것이 없어 Background가 스트림 ID를 발급하지 않음)
+    if (planCapturesTab(recordingPlan)) {
+      if (!streamId) {
+        throw new Error(ERROR_MESSAGES.CAPTURE_FAILED);
+      }
+      // Manifest V3 방식: streamId를 사용하여 MediaStream 획득. 마이크만 녹음하면 탭 오디오는 요청하지 않음
+      // (캡처하지 않은 탭은 평소처럼 소리가 나므로 루프백도 필요 없음)
+      const constraints = {
+        audio: captureTabAudio
+          ? {
+            mandatory: {
+              chromeMediaSource: 'tab',
+              chromeMediaSourceId: streamId
+            }
           }
-        }
-        : false
-    };
+          : false,
+        video: recordingPlan.captureVideo
+          ? {
+            mandatory: {
+              chromeMediaSource: 'tab',
+              chromeMediaSourceId: streamId,
+              maxWidth: VIDEO_SETTINGS.MAX_WIDTH,
+              maxHeight: VIDEO_SETTINGS.MAX_HEIGHT,
+              maxFrameRate: VIDEO_SETTINGS.FRAME_RATE
+            }
+          }
+          : false
+      };
 
-    console.log('[Offscreen] Constraints:', JSON.stringify(constraints, null, 2));
+      console.log('[Offscreen] Constraints:', JSON.stringify(constraints, null, 2));
 
-    stream = await navigator.mediaDevices.getUserMedia(constraints);
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
 
-    if (!stream) {
-      throw new Error(ERROR_MESSAGES.CAPTURE_FAILED);
+      if (!stream) {
+        throw new Error(ERROR_MESSAGES.CAPTURE_FAILED);
+      }
+
+      const audioTracks = stream.getAudioTracks();
+      console.log('[Offscreen] 오디오 트랙 개수:', audioTracks.length);
+      if (captureTabAudio && audioTracks.length === 0) {
+        throw new Error(ERROR_MESSAGES.NO_AUDIO);
+      }
     }
 
-    const audioTracks = stream.getAudioTracks();
-    console.log('[Offscreen] 오디오 트랙 개수:', audioTracks.length);
-    if (audioTracks.length === 0) {
-      throw new Error(ERROR_MESSAGES.NO_AUDIO);
+    // 마이크: 탭 스트림 ID를 쓴 다음에 엶 (스트림 ID는 발급 직후 써야 함). 권한은 설정 페이지에서 미리 허용 (offscreen은 권한 창을 띄울 수 없음)
+    if (captureMic) {
+      micStream = await openMicStream(recordingPlan.micDeviceId);
     }
 
     let videoTrack = null;
@@ -168,32 +195,42 @@ async function handleStartCapture(data, sendResponse) {
     if (saveFolder) recordingFileBase = saveFolder.baseName;
     console.log('[Offscreen] 저장 위치:', saveFolder ? `폴더 "${saveFolder.name}" (직접 기록)` : '다운로드 폴더', recordingFileBase);
 
-    // AudioContext 루프백 설정 (사용자가 소리를 계속 들을 수 있도록)
-    setupLoopback(stream);
+    // 오디오 그래프: 탭 소리는 destination 루프백(사용자가 계속 들을 수 있도록), 마이크는 녹음에만
+    setupAudioSources({ tabStream: captureTabAudio ? stream : null, mic: micStream });
 
     // 스트리밍 녹음/녹화 시작
-    await startStreamingRecording(stream, videoTrack);
+    await startStreamingRecording(videoTrack);
     isCapturing = true;
 
     // 탭이 닫히거나 캡처가 끊기면 스스로 마무리
-    for (const track of stream.getTracks()) {
-      track.onended = () => {
-        console.warn('[Offscreen] 캡처 트랙 종료 감지:', track.kind);
-        if (track.kind === 'video' || !recordingPlan.captureVideo) {
-          stopCaptureInternal().catch((error) => console.error('[Offscreen] 트랙 종료 후 중지 실패:', error));
-        }
-      };
+    if (stream) {
+      for (const track of stream.getTracks()) {
+        track.onended = () => {
+          console.warn('[Offscreen] 캡처 트랙 종료 감지:', track.kind);
+          if (track.kind === 'video' || !recordingPlan.captureVideo) {
+            stopCaptureInternal().catch((error) => console.error('[Offscreen] 트랙 종료 후 중지 실패:', error));
+          }
+        };
+      }
+    }
+    // 마이크 연결이 끊기면(USB 분리 등): 마이크가 유일한 소스면 마무리, 아니면 계속 녹화하고 경고
+    if (micStream) {
+      for (const track of micStream.getAudioTracks()) {
+        track.onended = () => handleMicTrackEnded(track);
+      }
     }
 
     // 하트비트 시작 (SW가 재시작되어도 녹화 상태를 복구할 수 있도록 식별 정보를 함께 보냄)
     startHeartbeat(heartbeatIntervalMs || SETTINGS.HEARTBEAT_INTERVAL);
 
-    // Background에 시작 알림
+    // Background에 시작 알림 (고른 마이크 대신 기본 마이크로 녹음하는 경우 등의 경고 포함, 시작 시점이라 현재형 문구)
+    const startWarnings = captureWarnings.map(w => START_NOTICES[w] || w);
     await chrome.runtime.sendMessage({
-      action: MESSAGE_TYPES.RECORDING_STARTED
+      action: MESSAGE_TYPES.RECORDING_STARTED,
+      data: { warnings: startWarnings }
     });
 
-    sendResponse({ success: true });
+    sendResponse({ success: true, warnings: startWarnings });
 
     // 시작 도중(캡처 상태가 되기 전)에 영상 파일 쓰기가 이미 실패했다면 지금 멈춤
     if (videoSession && videoSession.writeError) handleVideoWriteError(videoSession.writeError);
@@ -357,22 +394,118 @@ async function stopCaptureInternal() {
   }
 }
 
-// AudioContext 루프백 설정 (사용자가 소리를 듣도록)
-function setupLoopback(mediaStream) {
-  try {
-    if (!audioContext || audioContext.state === 'closed') {
-      audioContext = new AudioContext({ sampleRate: recordingSampleRate });
-      console.log('AudioContext 생성됨:', audioContext.sampleRate, 'Hz');
-    }
-
-    audioSource = audioContext.createMediaStreamSource(mediaStream);
-    audioSource.connect(audioContext.destination);
-
-    console.log('AudioContext 루프백 설정 완료 - 사용자가 소리를 들을 수 있습니다');
-  } catch (error) {
-    console.error('루프백 설정 실패:', error);
-    console.warn('녹음은 계속 진행되지만 소리가 들리지 않을 수 있습니다');
+// 녹음용 AudioContext (사용자 설정 샘플레이트). 마이크가 다른 샘플레이트(보통 48 kHz)여도 MediaStreamSource가 이 값으로 리샘플링하므로
+// WAV/MP3 인코더와 영상 컨테이너 오디오는 항상 audioContext.sampleRate로 설정됨
+function ensureAudioContext() {
+  if (!audioContext || audioContext.state === 'closed') {
+    audioContext = new AudioContext({ sampleRate: recordingSampleRate });
+    console.log('AudioContext 생성됨:', audioContext.sampleRate, 'Hz');
   }
+  return audioContext;
+}
+
+// 오디오 소스 그래프:
+//   탭 오디오 → (1) destination  : 탭 캡처는 탭 소리를 가로채므로 다시 스피커로 내보내 사용자가 계속 들을 수 있게 함 (루프백)
+//            → (2) GainNode(1) → AudioWorklet
+//   마이크     → GainNode(1) → AudioWorklet   : destination에는 절대 연결하지 않음 (스피커로 나가면 에코·하울링)
+// 여러 연결이 워크릿의 같은 입력으로 들어오면 Web Audio가 합산(모노 마이크는 스테레오로 업믹스)하므로 워크릿 이후(인코더, 일시정지)는 기존과 같음.
+// 워크릿은 출력에 아무것도 쓰지 않아(무음) destination에 연결해도 소리가 나지 않음 - 렌더링을 계속 끌어오기 위한 연결
+function setupAudioSources({ tabStream, mic }) {
+  ensureAudioContext();
+  if (tabStream) {
+    audioSource = audioContext.createMediaStreamSource(tabStream);
+    try {
+      audioSource.connect(audioContext.destination);
+      console.log('AudioContext 루프백 설정 완료 - 사용자가 소리를 들을 수 있습니다');
+    } catch (error) {
+      console.error('루프백 설정 실패:', error);
+      console.warn('녹음은 계속 진행되지만 소리가 들리지 않을 수 있습니다');
+    }
+    tabGain = createSourceGain(audioSource);
+  }
+  if (mic) {
+    micSource = audioContext.createMediaStreamSource(mic);
+    micGain = createSourceGain(micSource);
+    console.log('[Offscreen] 마이크 입력 연결 (녹음에만 사용, 스피커로는 내보내지 않음)');
+  }
+}
+
+function createSourceGain(source) {
+  const gain = audioContext.createGain();
+  gain.gain.value = MIC_SETTINGS.SOURCE_GAIN;
+  source.connect(gain);
+  return gain;
+}
+
+// 마이크 열기: 고른 장치(deviceId exact) → 없으면(분리됨, 다른 PC에서 동기화된 ID) 시스템 기본 마이크로 다시 시도하고 경고.
+// 권한 거부(NotAllowedError)는 다른 장치로 재시도해도 같으므로 바로 실패 (offscreen 문서는 권한 창을 띄울 수 없음)
+async function openMicStream(deviceId) {
+  const request = (id) => {
+    const audio = id ? { deviceId: { exact: id }, ...MIC_SETTINGS.PROCESSING } : { ...MIC_SETTINGS.PROCESSING };
+    console.log('[Offscreen] 마이크 요청:', JSON.stringify(audio));
+    return navigator.mediaDevices.getUserMedia({ audio });
+  };
+  let mic;
+  try {
+    mic = await request(deviceId);
+  } catch (error) {
+    if (!deviceId || !isMicDeviceMissing(error)) throw toMicError(error);
+    console.warn('[Offscreen] 고른 마이크를 찾을 수 없어 시스템 기본 마이크로 다시 시도:', describeError(error));
+    try {
+      mic = await request(null);
+    } catch (retryError) {
+      throw toMicError(retryError);
+    }
+    captureWarnings.push(ERROR_MESSAGES.MIC_FALLBACK_DEFAULT);
+  }
+  const tracks = mic ? mic.getAudioTracks() : [];
+  if (tracks.length === 0) {
+    stopTracks(mic);
+    throw new Error(ERROR_MESSAGES.MIC_UNAVAILABLE);
+  }
+  const settings = tracks[0].getSettings ? tracks[0].getSettings() : {};
+  console.log('[Offscreen] 마이크 트랙:', tracks[0].label, settings);
+  return mic;
+}
+
+function isMicDeviceMissing(error) {
+  return !!error && (error.name === 'OverconstrainedError' || error.name === 'NotFoundError');
+}
+
+// getUserMedia 오류 → 사용자 메시지 (탭 캡처 오류와 섞이지 않도록 마이크 전용 메시지로 바꿈)
+function toMicError(error) {
+  const name = error && error.name;
+  console.error('[Offscreen] 마이크 열기 실패:', describeError(error));
+  if (name === 'NotAllowedError' || name === 'SecurityError' || name === 'PermissionDeniedError') return new Error(ERROR_MESSAGES.MIC_PERMISSION_DENIED);
+  if (name === 'NotFoundError' || name === 'OverconstrainedError' || name === 'DevicesNotFoundError') return new Error(ERROR_MESSAGES.MIC_DEVICE_NOT_FOUND);
+  return new Error(`${ERROR_MESSAGES.MIC_UNAVAILABLE} (${describeError(error)})`);
+}
+
+function stopTracks(mediaStream, label = '트랙') {
+  if (!mediaStream) return;
+  try {
+    for (const track of mediaStream.getTracks()) {
+      track.onended = null;
+      try { track.stop(); console.log(`[Cleanup] ${label} 중지:`, track.kind); } catch (e) { console.warn(`[Cleanup] ${label} 중지 실패:`, e); }
+    }
+  } catch (error) {
+    console.warn('[Cleanup] getTracks() 호출 실패:', error);
+  }
+}
+
+// 녹화 중 마이크 트랙이 끝남 (장치 분리 등 - track.stop()으로는 불리지 않음)
+function handleMicTrackEnded(track) {
+  if (!isCapturing || stopping) return;
+  if (!stream) {
+    // 오디오만 + 마이크: 녹음할 소스가 없어졌으므로 그때까지의 녹음으로 마무리 (탭이 닫힌 경우와 같음)
+    console.warn('[Offscreen] 마이크 연결 끊김 → 녹음 마무리:', track && track.label);
+    if (!captureWarnings.includes(ERROR_MESSAGES.MIC_DISCONNECTED_STOPPED)) captureWarnings.push(ERROR_MESSAGES.MIC_DISCONNECTED_STOPPED);
+    stopCaptureInternal().catch((error) => console.error('[Offscreen] 마이크 끊김 후 중지 실패:', error));
+    return;
+  }
+  // 탭 오디오·영상은 계속 녹화 (마이크 쪽은 이후 무음)
+  console.warn('[Offscreen] 마이크 연결 끊김 → 탭 녹화는 계속:', track && track.label);
+  if (!captureWarnings.includes(ERROR_MESSAGES.MIC_DISCONNECTED)) captureWarnings.push(ERROR_MESSAGES.MIC_DISCONNECTED);
 }
 
 function describeError(error) {
@@ -490,14 +623,11 @@ async function createAudioFileEncoder(format, channels, sampleRate) {
   return new WavFileEncoder({ sampleRate, channels, sink });
 }
 
-// 스트리밍 녹음/녹화 시작
-async function startStreamingRecording(mediaStream, videoTrack) {
+// 스트리밍 녹음/녹화 시작 (오디오 소스 그래프는 setupAudioSources가 미리 만들어 둠)
+async function startStreamingRecording(videoTrack) {
   try {
     // AudioContext 상태 검증 및 생성
-    if (!audioContext || audioContext.state === 'closed') {
-      audioContext = new AudioContext({ sampleRate: recordingSampleRate });
-      console.log('[StreamingRecording] AudioContext 생성 완료:', audioContext.sampleRate, 'Hz');
-    }
+    ensureAudioContext();
 
     if (audioContext.state === 'suspended') {
       await audioContext.resume();
@@ -569,12 +699,12 @@ async function startStreamingRecording(mediaStream, videoTrack) {
       }
     };
 
-    if (!audioSource) {
-      audioSource = audioContext.createMediaStreamSource(mediaStream);
+    // 소스별 GainNode(탭, 마이크) → AudioWorklet(합산) → destination (워크릿 출력은 무음)
+    const inputs = [tabGain, micGain].filter(Boolean);
+    if (inputs.length === 0) {
+      throw new Error(ERROR_MESSAGES.NO_AUDIO);
     }
-
-    // MediaStream → AudioWorklet → destination
-    audioSource.connect(audioWorkletNode);
+    for (const input of inputs) input.connect(audioWorkletNode);
     audioWorkletNode.connect(audioContext.destination);
 
     // 오디오 녹음 시작 (영상 세션은 이 시각을 기준으로 A/V 정렬)
@@ -738,7 +868,8 @@ async function handleStreamingRecordingStop() {
         ? `${videoError.message} 오디오 파일만 저장되었습니다.`
         : `영상 파일 저장에 실패했습니다 (${videoError.message}). 오디오 파일만 저장되었습니다.`);
     }
-    const allWarnings = [...saveWarnings, ...warnings];
+    // 캡처 경고(마이크 대체·끊김) → 저장 위치 경고 → 영상 경고 순
+    const allWarnings = [...captureWarnings, ...saveWarnings, ...warnings];
     const warning = allWarnings.length ? allWarnings.join(' ') : undefined;
     const inFolder = files.filter(f => f.savedTo === SAVE_LOCATIONS.FOLDER).length;
 
@@ -748,6 +879,7 @@ async function handleStreamingRecordingStop() {
         success: true,
         files,
         warning,
+        warnings: allWarnings,
         timings,
         storage: recordingStorage ? recordingStorage.kind : 'memory',
         // 저장 위치 요약: 모두 폴더 / 모두 다운로드 / 섞임 (파일별 위치는 files[].savedTo, files[].location)
@@ -858,10 +990,16 @@ async function cleanup() {
   const mediaStream = stream;
   const source = audioSource;
   const context = audioContext;
+  const mic = micStream;
+  const audioNodes = [micSource, tabGain, micGain];
   videoSession = null;
   stream = null;
   audioSource = null;
   audioContext = null;
+  micStream = null;
+  micSource = null;
+  tabGain = null;
+  micGain = null;
   streamingEncoder = null;
   // 저장 위치 상태 (싱크는 이미 닫혔거나 시작 실패 경로에서 정리됨)
   saveFolder = null;
@@ -886,6 +1024,10 @@ async function cleanup() {
   if (source) {
     try { source.disconnect(); } catch (error) { console.warn('[Cleanup] AudioSource 연결 해제 실패:', error); }
   }
+  for (const node of audioNodes) {
+    if (!node) continue;
+    try { node.disconnect(); } catch (error) { console.warn('[Cleanup] 오디오 노드 연결 해제 실패:', error); }
+  }
 
   if (mediaStream) {
     try {
@@ -896,6 +1038,8 @@ async function cleanup() {
       console.warn('[Cleanup] getTracks() 호출 실패:', error);
     }
   }
+  // 마이크 트랙 중지 (마이크 사용 표시 끄기). onended를 먼저 떼어 정리 중 끊김 처리가 돌지 않게 함
+  stopTracks(mic, '마이크 트랙');
 
   if (context && context.state !== 'closed') {
     context.close().catch((error) => console.warn('[Cleanup] AudioContext 종료 실패:', error));
